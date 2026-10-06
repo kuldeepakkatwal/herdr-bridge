@@ -25,12 +25,14 @@ if [ "$OS" = linux ]; then
   systemctl --user show-environment >/dev/null 2>&1 || fail "systemd user services are not available here (systemctl --user does not work). Log in with a normal desktop or SSH session, then run this again."
 fi
 
+say "Downloading the bridge…"
 mkdir -p "$DIR"
 for f in herdr_remote.py qrcodegen.py com.herdr-remote.bridge.plist; do
   curl -fsSL "$BASE/$f" -o "$DIR/$f.new" || fail "Could not download $f. Check the internet connection and run this again."
   mv "$DIR/$f.new" "$DIR/$f"
 done
 
+say "Checking who is signed in to Tailscale…"
 STATUS="$("$TS" status --json 2>/dev/null)" || fail "Tailscale is not running or not signed in. Open Tailscale, sign in, then run this again."
 OWNER="$(printf '%s' "$STATUS" | "$PY" "$DIR/herdr_remote.py" --owner-from-status)" || fail "Could not tell who is signed in to Tailscale. Sign in to Tailscale, then run this again."
 HOST="$(printf '%s' "$STATUS" | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
@@ -38,6 +40,7 @@ HOST="$(printf '%s' "$STATUS" | "$PY" -c 'import json,sys;print(json.load(sys.st
 # Run once so the owner and port are saved to ~/.herdr-remote/config.json, then stop it.
 "$PY" "$DIR/herdr_remote.py" --owner "$OWNER" --port "$PORT" >/dev/null 2>&1 & PID=$!; sleep 1; kill $PID 2>/dev/null || true
 
+say "Starting the bridge (it will also start by itself after a restart)…"
 if [ "$OS" = mac ]; then
   PLIST="$HOME/Library/LaunchAgents/com.herdr-remote.bridge.plist"
   mkdir -p "$HOME/Library/LaunchAgents"
@@ -65,7 +68,9 @@ UNIT
   loginctl enable-linger "$USER" 2>/dev/null || say "Note: the bridge runs while you are logged in to this computer."
 fi
 
-serve() { "$TS" serve --bg --https=$PORT http://127.0.0.1:$PORT 2>&1; }
+# Tailscale's output is shown live: if Serve is off for the account it prints a link and waits until it is approved.
+serve() { "$TS" serve --bg --https=$PORT http://127.0.0.1:$PORT 2>&1 | tee /dev/stderr; return "${PIPESTATUS[0]}"; }
+say "Publishing the bridge on your Tailscale network… (if Tailscale shows a link below, open it, approve, and this continues)"
 if ! OUT="$(serve)"; then
   case "$OUT" in
     *ccess*denied*|*ermission*|*operator*)
