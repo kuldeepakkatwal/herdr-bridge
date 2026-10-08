@@ -6,19 +6,27 @@ Tailscale-User-Login header this bridge checks.
 """
 import argparse
 import base64
+import errno
+import fcntl
 import glob
 import json
 import os
 import platform
+import pty
 import queue
 import re
+import select
 import shutil
+import signal
 import socket
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 import traceback
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -244,6 +252,167 @@ def read_screen(pane, source="recent_unwrapped", fmt="ansi", lines=400):
     return call("pane.read", params)["read"]["text"]
 
 
+# Terminal mode: herdr's own client (`herdr session attach`) in a pseudo-terminal, streamed to the phone.
+# launchd's PATH has no ~/.local/bin, so look there ourselves.
+HERDR_BIN = shutil.which("herdr") or os.path.join(HOME, ".local/bin/herdr")
+HERDR_SESSION = "default"
+TERM_IDLE = 10          # seconds without a stream before a term is closed
+TERM_MAX = 3            # terms per bridge; the oldest is closed when exceeded
+TERMS = {}              # term_id -> Term
+TERMS_LOCK = threading.Lock()
+TERM_OPS = threading.RLock()   # held for a whole open/close, so one pane's zoom on/off never interleave
+TERM_ARGV_OVERRIDE = None   # tests only: run this instead of herdr's client
+
+
+def _winsize(cols, rows):
+    return struct.pack("HHHH", rows, cols, 0, 0)
+
+
+class Term:
+    """One command in a pty. Output chunks land in `q` (None = ended). `streams` counts open SSE readers."""
+    def __init__(self, pane, cols, rows, argv=None):
+        self.id = uuid.uuid4().hex[:12]
+        self.pane = pane
+        self.q = queue.Queue()
+        self.alive = True
+        self.closed = False
+        self.lock = threading.Lock()   # guards fd: the pump closes it, write/resize must never use a stale number
+        self.streams = 0
+        self.last_stream = time.time()
+        argv = argv or [HERDR_BIN, "session", "attach", HERDR_SESSION]
+        # drop herdr's "you are inside a pane" variables (the bridge may run in one), built before fork
+        env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
+        env["TERM"] = "xterm-256color"
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:   # child: size the terminal, run the client
+            try:
+                fcntl.ioctl(0, termios.TIOCSWINSZ, _winsize(cols, rows))
+                os.execvpe(argv[0], argv, env)
+            finally:
+                os._exit(127)
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        try:
+            while True:
+                data = os.read(self.fd, 65536)
+                if not data:
+                    break
+                self.q.put(data)
+        except OSError:
+            pass    # EIO: the child is gone
+        self.alive = False
+        with self.lock:
+            try:
+                os.close(self.fd)   # closed here, not in close(), so a read never lands on a reused fd number
+            except OSError:
+                pass
+            self.fd = -1
+        self.q.put(None)
+
+    def write(self, data):
+        with self.lock:
+            if self.fd < 0:
+                raise OSError(errno.EBADF, "terminal closed")
+            while data:   # os.write may take only part of it
+                data = data[os.write(self.fd, data):]
+
+    def resize(self, cols, rows):
+        with self.lock:
+            if self.fd < 0:
+                raise OSError(errno.EBADF, "terminal closed")
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ, _winsize(cols, rows))
+
+    def close(self):
+        """Hang up, then kill if it is still there after 2 s; always reap (also after it exited by itself)."""
+        if self.closed:
+            return
+        self.closed, self.alive = True, False
+        for sig in (signal.SIGHUP, signal.SIGKILL):
+            try:
+                os.kill(self.pid, sig)
+            except OSError:
+                pass
+            for _ in range(20):
+                try:
+                    if os.waitpid(self.pid, os.WNOHANG)[0]:
+                        break
+                except ChildProcessError:
+                    break
+                time.sleep(0.1)
+            else:
+                continue
+            break
+        self.q.put(None)
+
+
+def open_term(pane, cols, rows, argv=None):
+    """Attach herdr's client in a pty sized to the phone, looking at `pane` (focused and zoomed in herdr,
+    so the phone is not filled with the sidebar and the other panes). The Mac window follows: accepted."""
+    # ponytail: one lock for all terms (a close can take 2 s); fine for at most 3 terms on one phone
+    with TERM_OPS:
+        with TERMS_LOCK:
+            stale = [t for t in TERMS.values() if t.pane == pane]   # one term per pane
+            others = [t for t in TERMS.values() if t.pane != pane]  # oldest first (dicts keep insertion order)
+            stale += others[:max(0, len(others) - TERM_MAX + 1)]    # room for the new one under the cap
+        for t in stale:
+            close_term(t.id)
+        call("pane.focus", {"pane_id": pane})
+        call("pane.zoom", {"pane_id": pane, "mode": "on"})
+        try:
+            t = Term(pane, cols, rows, argv or TERM_ARGV_OVERRIDE)
+        except Exception:
+            _unzoom(pane)
+            raise
+        with TERMS_LOCK:
+            TERMS[t.id] = t
+        return t
+
+
+def _unzoom(pane):
+    try:
+        call("pane.zoom", {"pane_id": pane, "mode": "off"})
+    except (HerdrError, OSError, ValueError):
+        pass   # pane gone or herdr down: nothing to unzoom
+
+
+def close_term(term_id):
+    print("TMPLOG %.3f close_term %s" % (time.time(), term_id), file=sys.stderr, flush=True)
+    with TERM_OPS:
+        with TERMS_LOCK:
+            t = TERMS.pop(term_id, None)
+        if t is None:
+            return False
+        t.close()
+        _unzoom(t.pane)
+        return True
+
+
+def close_all_terms():
+    with TERMS_LOCK:
+        ids = list(TERMS)
+    for tid in ids:
+        close_term(tid)
+
+
+def reap_terms(now=None):
+    """Close terms nobody has streamed for TERM_IDLE seconds (phone went away without DELETE), and dead ones."""
+    now = now or time.time()
+    with TERMS_LOCK:
+        idle = [t.id for t in TERMS.values() if (t.streams == 0 and now - t.last_stream > TERM_IDLE) or not t.alive]
+    for tid in idle:
+        close_term(tid)
+
+
+def reap_loop():
+    while True:
+        time.sleep(2)
+        try:
+            reap_terms()
+        except Exception:   # must never die: an unreaped term keeps the Mac pane zoomed and phone-sized
+            traceback.print_exc()
+
+
 class Hub:
     """Holds the latest state; refreshes it from herdr; fans changes out to SSE clients."""
 
@@ -431,12 +600,19 @@ def session_of(hub, pane):
     return None
 
 
+def _size(body):
+    cols, rows = int(body["cols"]), int(body["rows"])
+    if not (10 <= cols <= 500 and 5 <= rows <= 300):
+        raise ValueError("size out of range")
+    return cols, rows
+
+
 def make_handler(hub, owner):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, *args):
-            pass
+            print("TMPLOG %.3f %s" % (time.time(), args[0] % args[1:]), file=sys.stderr, flush=True)
 
         def _json(self, code, obj):
             data = json.dumps(obj).encode()
@@ -479,6 +655,8 @@ def make_handler(hub, owner):
                     return self._err(409, e.code, str(e))
                 limit = int(parse_qs(u.query).get("limit", ["500"])[0])
                 return self._json(200, {"items": items[-limit:], "total": len(items), "title": title})
+            if len(parts) == 4 and parts[:2] == ["api", "term"] and parts[3] == "stream":
+                return self._term_stream(parts[2])
             if u.path == "/api/clipboard":
                 try:
                     return self._json(200, {"text": clip_get()})
@@ -524,6 +702,25 @@ def make_handler(hub, owner):
                     call("%s.rename" % kind, {"%s_id" % kind: unquote(parts[2]), "label": label})
                     hub.poke()
                     return self._json(200, {"ok": True})
+                if len(parts) == 4 and parts[:2] == ["api", "agents"] and parts[3] == "term":
+                    cols, rows = _size(body)
+                    t = open_term(unquote(parts[2]), cols, rows)
+                    return self._json(200, {"term_id": t.id})
+                if len(parts) == 4 and parts[:2] == ["api", "term"] and parts[3] in ("input", "resize"):
+                    with TERMS_LOCK:
+                        t = TERMS.get(parts[2])
+                    if t is None or not t.alive:
+                        return self._err(404, "not_found", "no such terminal")
+                    try:
+                        if parts[3] == "input":
+                            data = base64.b64decode(str(body["data"]))
+                            t.write(data)
+                        else:
+                            size = _size(body)
+                            t.resize(*size)
+                    except OSError:   # the client ended between the lookup and the write
+                        return self._err(404, "not_found", "no such terminal")
+                    return self._json(200, {"ok": True})
                 if len(parts) == 4 and parts[:2] == ["api", "agents"] and parts[3] in ACTIONS:
                     ACTIONS[parts[3]](unquote(parts[2]), body)
                     hub.kick(unquote(parts[2]))
@@ -532,10 +729,81 @@ def make_handler(hub, owner):
                 self._err(404, "not_found", self.path)
             except HerdrError as e:
                 self._err(409, e.code, str(e))
-            except (KeyError, ValueError, TypeError) as e:
+            except (KeyError, ValueError, TypeError, OverflowError) as e:
                 self._err(400, "bad_request", repr(e))
             except (OSError, subprocess.SubprocessError) as e:
                 self._err(503, "herdr_offline", str(e))
+
+        def do_DELETE(self):
+            if not self._authed():
+                return
+            parts = urlparse(self.path).path.strip("/").split("/")
+            if len(parts) == 3 and parts[:2] == ["api", "term"]:
+                if close_term(parts[2]):
+                    return self._json(200, {"ok": True})
+                return self._err(404, "not_found", "no such terminal")
+            self._err(404, "not_found", self.path)
+
+        def _term_stream(self, term_id):
+            with TERMS_LOCK:
+                t = TERMS.get(term_id)
+                ok = t is not None and t.alive
+                if ok:
+                    t.streams += 1
+            if not ok:
+                return self._err(404, "not_found", "no such terminal")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.close_connection = True
+                next_ping = time.time() + 5   # we talk to the local tailscale serve proxy: a clean close is seen
+                # within 0.5 s (_hung_up); a phone that just vanishes only once tailscaled drops its side
+                while True:
+                    try:
+                        chunk = t.q.get(timeout=0.5)
+                    except queue.Empty:
+                        if self._hung_up():
+                            return
+                        if time.time() > next_ping:
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                            next_ping = time.time() + 5
+                        continue
+                    if chunk is None:
+                        t.q.put(None)   # leave the end mark for any other reader
+                        self._sse("exit", {})
+                        return
+                    # drain what else is queued so one event carries a whole redraw
+                    while True:
+                        try:
+                            more = t.q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if more is None:
+                            t.q.put(None)
+                            break
+                        chunk += more
+                    self._sse("out", {"data": base64.b64encode(chunk).decode()})
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                with TERMS_LOCK:
+                    t.streams -= 1
+                    t.last_stream = time.time()
+                    last = t.streams == 0
+                if last:   # the phone left: free the Mac pane now (already gone after DELETE: returns False)
+                    close_term(t.id)
+
+        def _hung_up(self):
+            """True once the other end closed the connection (a GET sends nothing more, so readable = EOF).
+            Seen within 0.5 s, instead of waiting for a ping write to fail."""
+            try:
+                r = select.select([self.connection], [], [], 0)[0]
+                return bool(r) and not self.connection.recv(1, socket.MSG_PEEK)
+            except OSError:
+                return True
 
         def _sse(self, event, data):
             self.wfile.write(("event: %s\ndata: %s\n\n" % (event, json.dumps(data))).encode())
@@ -670,15 +938,15 @@ def main():
     if os.path.exists(CONFIG):
         with open(CONFIG) as f:
             cfg = json.load(f)
-    if args.owner:
-        cfg["owner"] = args.owner
     if args.port:
         cfg["port"] = args.port
+    if args.owner:   # only then is the config saved: `--port` alone is for this run (a test bridge must not move the service)
+        cfg["owner"] = args.owner
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        with open(CONFIG, "w") as f:
+            json.dump(cfg, f, indent=2)
     if not cfg.get("owner"):
         sys.exit("Set your Tailscale login once: herdr_remote.py --owner you@gmail.com")
-    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-    with open(CONFIG, "w") as f:
-        json.dump(cfg, f, indent=2)
     try:
         info = call("ping")
         if info.get("protocol") not in (None, 20):
@@ -687,6 +955,7 @@ def main():
         print("warning: herdr not reachable yet (%s); will keep retrying" % e, file=sys.stderr)
     hub = Hub()
     threading.Thread(target=hub.run, daemon=True).start()
+    threading.Thread(target=reap_loop, daemon=True).start()
     port = cfg.get("port", 8795)
     srv = make_server(hub, cfg["owner"], port)
     print("herdr-remote bridge on 127.0.0.1:%d for %s" % (port, cfg["owner"]), flush=True)

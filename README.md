@@ -2,6 +2,8 @@
 
 This is a small program that runs on your Mac or Linux computer. It lets the Herdr iPhone app talk to the herdr on that computer, so you can check on your agents from your phone. It runs quietly in the background and starts again every time you log in (on Linux it uses a systemd user service).
 
+Terminal mode in the app runs `herdr session attach` for you; while it is open your Mac's herdr window follows the phone.
+
 ## What you need first
 
 1. A Mac or a Linux computer.
