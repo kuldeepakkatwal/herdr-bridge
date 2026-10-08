@@ -84,43 +84,91 @@ def _tool_line(block):
     return "%s %s" % (block.get("name", "tool"), arg[:80] + ("…" if len(arg) > 80 else ""))
 
 
-def parse_transcript(path):
-    """Claude Code's saved session -> [{role, text}]: your prompts, its replies, short tool lines.
-    Skips thinking, tool results, meta/sidechain records and slash-command noise."""
-    items, title = [], None
+CMD_NAME = re.compile(r"<command-name>(.*?)</command-name>")
+CMD_ARGS = re.compile(r"<command-args>(.*?)</command-args>")
 
-    def add(role, text):
-        if role == "tool" and items and items[-1]["role"] == "tool":
-            items[-1]["text"] += "\n" + text
+
+class Tail:
+    """Follows one Claude Code transcript (jsonl, appended to as the conversation goes).
+
+    read() parses only what was appended since the last call and returns it as events
+    {"item": {role, text}, "replace_last": bool}. replace_last: a tool line merged into the previous
+    tool item, so that whole item is sent again. Keeps your prompts, Claude's replies and short tool
+    lines; skips thinking, tool results, meta/sidechain records and local command output.
+    """
+
+    def __init__(self, path=None, session=None):
+        self.path, self.session = path, session
+        self.offset, self.rest = 0, b""
+        self.items, self.title = [], None
+
+    def _add(self, role, text):
+        if role == "tool" and self.items and self.items[-1]["role"] == "tool":
+            self.items[-1]["text"] += "\n" + text
+            return {"item": dict(self.items[-1]), "replace_last": True}
+        self.items.append({"role": role, "text": text})
+        return {"item": dict(self.items[-1]), "replace_last": False}
+
+    def _record(self, line):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            return []
+        t = d.get("type")
+        if t == "ai-title":
+            self.title = d.get("aiTitle") or self.title
+            return []
+        if t not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain"):
+            return []
+        content = (d.get("message") or {}).get("content")
+        out = []
+        if t == "user":
+            if isinstance(content, list):
+                content = "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
+            text = (content or "").strip() if isinstance(content, str) else ""
+            m = CMD_NAME.match(text)
+            if m:   # a slash command is saved as tags: show it the way it was typed
+                args = CMD_ARGS.search(text)
+                text = m.group(1) + (" " + args.group(1).strip() if args and args.group(1).strip() else "")
+            if text and not text.startswith("<"):
+                out.append(self._add("user", text))
         else:
-            items.append({"role": role, "text": text})
+            for b in content or []:
+                if b.get("type") == "text" and b.get("text", "").strip():
+                    out.append(self._add("assistant", b["text"].strip()))
+                elif b.get("type") == "tool_use":
+                    out.append(self._add("tool", _tool_line(b)))
+        return out
 
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
-            t = d.get("type")
-            if t == "ai-title":
-                title = d.get("aiTitle") or title
-                continue
-            if t not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain"):
-                continue
-            content = (d.get("message") or {}).get("content")
-            if t == "user":
-                if isinstance(content, list):
-                    content = "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
-                text = (content or "").strip() if isinstance(content, str) else ""
-                if text and not text.startswith("<"):
-                    add("user", text)
-            else:
-                for b in content or []:
-                    if b.get("type") == "text" and b.get("text", "").strip():
-                        add("assistant", b["text"].strip())
-                    elif b.get("type") == "tool_use":
-                        add("tool", _tool_line(b))
-    return items, title
+    def read(self):
+        """Events appended since the last read. None: the file shrank or was replaced, start over
+        (the caller sends the whole history again)."""
+        if not self.path and self.session:
+            self.path = session_file(self.session)   # a new session's file appears a moment after it starts
+        if not self.path or not os.path.exists(self.path):
+            return []
+        if os.stat(self.path).st_size < self.offset:
+            self.__init__(self.path, self.session)
+            return None
+        with open(self.path, "rb") as f:
+            f.seek(self.offset)
+            chunk = f.read()
+        if not chunk:
+            return []
+        self.offset += len(chunk)
+        lines = (self.rest + chunk).split(b"\n")
+        self.rest = lines.pop()   # the last piece has no newline yet (empty when the file ends with one)
+        out = []
+        for raw in lines:
+            out.extend(self._record(raw.decode("utf-8", "replace")))
+        return out
+
+
+def parse_transcript(path):
+    """Claude Code's saved session -> ([{role, text}], title)."""
+    t = Tail(path)
+    t.read()
+    return t.items, t.title
 
 
 def transcript(session_id):
@@ -154,6 +202,7 @@ def build_state(workspaces, tabs, agents):
                 "title": tab_label.get(a.get("tab_id")) or a.get("terminal_title_stripped") or _session_title(a) or a.get("agent") or a["pane_id"],
                 "agent": a.get("agent"),
                 "status": a.get("agent_status", "unknown"),
+                "session": (a.get("agent_session") or {}).get("value"),   # Claude Code session id: its transcript file
                 "cwd": tilde(a.get("cwd")),
                 "menu": None,
             } for a in ags],
@@ -292,26 +341,33 @@ def _prompt(pane, b):
     call("pane.send_keys", {"pane_id": pane, "keys": ["enter"]})
 
 
-def image_to_clipboard(path):
-    """Mac: put the PNG on the clipboard, so ctrl+v in Claude Code attaches it as [Image #n]."""
-    subprocess.run(["osascript", "-e", 'set the clipboard to (read (POSIX file "%s") as «class PNGf»)' % path], check=True, timeout=10)
+IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG")   # JPEG, PNG
+MAX_IMAGE = 10 << 20
 
 
-def _image(pane, b):
-    """Save the phone's picture, then paste it like ctrl+v on the Mac. Elsewhere, type its path."""
-    data = base64.b64decode(b["png"], validate=True)
-    if not data.startswith(b"\x89PNG"):
-        raise ValueError("not a PNG")
+def _send(pane, b):
+    """Pictures from the phone are saved as files and their paths typed into the agent with the text,
+    then Enter: Claude Code opens image files from a typed path. Rejected: the Mac clipboard paste
+    (an osascript plus a 0.5 s wait per picture, and it replaced the owner's clipboard)."""
+    images = b.get("images") or []
+    if not isinstance(images, list) or len(images) > 5:
+        raise ValueError("images must be a list of at most 5")
+    blobs = [base64.b64decode(enc, validate=True) for enc in images]
+    for i, data in enumerate(blobs):
+        if not data.startswith(IMAGE_MAGIC) or len(data) > MAX_IMAGE:
+            raise ValueError("image %d is not a JPEG/PNG under 10 MB" % i)
     os.makedirs(UPLOADS, exist_ok=True)
-    path = os.path.join(UPLOADS, "%d.png" % (time.time() * 1000))
-    with open(path, "wb") as f:
-        f.write(data)
-    if platform.system() == "Darwin":
-        image_to_clipboard(path)
-        call("pane.send_keys", {"pane_id": pane, "keys": ["ctrl+v"]})
-        time.sleep(0.5)   # Claude Code reads the clipboard after the key; the next picture must not replace it first
-    else:
-        call("pane.send_text", {"pane_id": pane, "text": path + " "})
+    stamp, paths = int(time.time() * 1000), []
+    for i, data in enumerate(blobs):
+        path = os.path.join(UPLOADS, "%d-%d.%s" % (stamp, i, "png" if data.startswith(b"\x89") else "jpg"))
+        with open(path, "wb") as f:
+            f.write(data)
+        paths.append(path)
+    text = " ".join(paths + [str(b.get("text") or "").strip()]).strip()
+    if not text:
+        raise ValueError("nothing to send")
+    call("pane.send_text", {"pane_id": pane, "text": text})
+    call("pane.send_keys", {"pane_id": pane, "keys": ["enter"]})
 
 
 # pane.* works on every pane; agent.* refuses a plain shell.
@@ -319,7 +375,7 @@ ACTIONS = {
     "keys": lambda pane, b: call("pane.send_keys", {"pane_id": pane, "keys": _keys(b["keys"])}),
     "text": lambda pane, b: call("pane.send_text", {"pane_id": pane, "text": str(b["text"])}),
     "prompt": _prompt,
-    "image": _image,
+    "send": _send,
     "answer": lambda pane, b: call("pane.send_keys", {"pane_id": pane, "keys": [str(int(b["choice"]))]}),
 }
 
@@ -365,6 +421,14 @@ def new_tab(hub, workspace_id, body):
     if body.get("kind", "claude") != "shell":
         start_agent(pane, body.get("kind", "claude"))
     return pane
+
+
+def session_of(hub, pane):
+    for w in hub.snapshot()["workspaces"]:
+        for a in w["agents"]:
+            if a["pane_id"] == pane:
+                return a.get("session")
+    return None
 
 
 def make_handler(hub, owner):
@@ -486,6 +550,11 @@ def make_handler(hub, owner):
             self.close_connection = True
             q = hub.subscribe(watch)
             last, next_ping = None, time.time() + 15
+            tail, session = None, False   # False: not looked up yet (None is a real answer: a plain shell)
+
+            def full():
+                self._sse("history_full", {"pane_id": watch, "items": tail.items[-500:], "title": tail.title})
+
             try:
                 self._sse("state", hub.snapshot())
                 while True:
@@ -500,6 +569,27 @@ def make_handler(hub, owner):
                         if text is not None and text != last:
                             last = text
                             self._sse("screen", {"pane_id": watch, "text": text})
+                        # Claude Code appends each message to its transcript the moment it happens. Follow
+                        # that file (one stat per tick, on this computer; nothing crosses the network unless
+                        # it grew) and push new entries at once, instead of the phone re-fetching on timers.
+                        try:
+                            sid = session_of(hub, watch)
+                            if tail is None or sid != session:
+                                session, tail = sid, Tail(session=sid)
+                                tail.read()
+                                full()
+                            else:
+                                new = tail.read()
+                                if new is None:   # file replaced or truncated: send it whole again
+                                    tail.read()
+                                    full()
+                                else:
+                                    for ev in new:
+                                        self._sse("history", {"pane_id": watch, "item": ev["item"], "replace_last": ev["replace_last"]})
+                        except (BrokenPipeError, ConnectionResetError):
+                            raise   # the phone went away: stop the stream
+                        except OSError:
+                            pass    # transcript file mid-rename or unreadable: try again next tick
                     try:
                         kind, data = q.get(timeout=0.2)
                         if kind == "kick":
