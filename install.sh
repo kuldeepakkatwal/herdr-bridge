@@ -26,8 +26,8 @@ if [ "$OS" = linux ]; then
 fi
 
 say "Downloading the bridge…"
-mkdir -p "$DIR"
-for f in herdr_remote.py qrcodegen.py com.herdr-remote.bridge.plist; do
+mkdir -p "$DIR/web"
+for f in herdr_remote.py qrcodegen.py com.herdr-remote.bridge.plist web/index.html web/app.js web/app.css web/marked.min.js web/manifest.webmanifest web/icon.svg web/icon-180.png; do
   curl -fsSL "$BASE/$f" -o "$DIR/$f.new" || fail "Could not download $f. Check the internet connection and run this again."
   mv "$DIR/$f.new" "$DIR/$f"
 done

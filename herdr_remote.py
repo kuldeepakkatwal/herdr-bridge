@@ -96,12 +96,23 @@ CMD_NAME = re.compile(r"<command-name>(.*?)</command-name>")
 CMD_ARGS = re.compile(r"<command-args>(.*?)</command-args>")
 
 
+def _typed(text):
+    """A slash command is saved as tags: give it back the way it was typed."""
+    m = CMD_NAME.match(text)
+    if not m:
+        return text
+    args = CMD_ARGS.search(text)
+    return m.group(1) + (" " + args.group(1).strip() if args and args.group(1).strip() else "")
+
+
 class Tail:
     """Follows one Claude Code transcript (jsonl, appended to as the conversation goes).
 
     read() parses only what was appended since the last call and returns it as events
-    {"item": {role, text}, "replace_last": bool}. replace_last: a tool line merged into the previous
-    tool item, so that whole item is sent again. Keeps your prompts, Claude's replies and short tool
+    {"item": {role, text, ts[, state]}, "index": position in self.items, "replace_last": bool}.
+    replace_last: the event replaces the last item (a tool line merged into it, or its state changed).
+    An event with a lower index and replace_last False changed an earlier item (a queued message taken).
+    Keeps your prompts (also the ones typed while Claude was busy), Claude's replies and short tool
     lines; skips thinking, tool results, meta/sidechain records and local command output.
     """
 
@@ -109,13 +120,50 @@ class Tail:
         self.path, self.session = path, session
         self.offset, self.rest = 0, b""
         self.items, self.title = [], None
+        self.expect = []   # texts of dequeued messages: Claude Code writes each once more as a user record
+        self.queue = []    # Claude Code's queue as (text, item index or None for a hidden notification), oldest first
 
-    def _add(self, role, text):
+    def _event(self, i):
+        return {"item": dict(self.items[i]), "index": i, "replace_last": i == len(self.items) - 1}
+
+    def _add(self, role, text, ts, state=None):
         if role == "tool" and self.items and self.items[-1]["role"] == "tool":
             self.items[-1]["text"] += "\n" + text
-            return {"item": dict(self.items[-1]), "replace_last": True}
-        self.items.append({"role": role, "text": text})
-        return {"item": dict(self.items[-1]), "replace_last": False}
+            return self._event(len(self.items) - 1)
+        item = {"role": role, "text": text, "ts": ts}
+        if state:
+            item["state"] = state
+        self.items.append(item)
+        return dict(self._event(len(self.items) - 1), replace_last=False)
+
+    def _mark(self, i, state):
+        if i is None:
+            return []
+        self.items[i]["state"] = state
+        return [self._event(i)]
+
+    def _queue(self, d):
+        # A message typed while Claude is busy is only an enqueue. Taken mid-turn (remove,
+        # absorbed_mid_turn) it never becomes a user record; taken at turn start (dequeue) it does.
+        # Hidden notifications stay in self.queue too, so a dequeue pops the same entry Claude Code did.
+        op, text = d.get("operation"), _typed((d.get("content") or "").strip())
+        if op == "enqueue" and text:
+            hidden = text.startswith("<")
+            out = [] if hidden else [self._add("user", text, d.get("timestamp"), "queued")]
+            self.queue.append((text, None if hidden else len(self.items) - 1))
+            return out
+        if op == "remove":
+            hit = [k for k, (t, _) in enumerate(self.queue) if t == text]
+            if not hit:
+                return []
+            taken = d.get("reason") in ("absorbed_mid_turn", "delivered_to_agent")
+            return self._mark(self.queue.pop(hit[-1])[1], "sent" if taken else "dropped")   # dropped: cleared, never sent
+        if op == "dequeue" and self.queue:
+            text, i = self.queue.pop(0)
+            if i is not None:
+                self.expect.append(text)
+            return self._mark(i, "sent")
+        return []
 
     def _record(self, line):
         try:
@@ -126,26 +174,32 @@ class Tail:
         if t == "ai-title":
             self.title = d.get("aiTitle") or self.title
             return []
+        if t == "queue-operation":
+            return self._queue(d)
         if t not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain"):
             return []
         content = (d.get("message") or {}).get("content")
+        ts = d.get("timestamp")
         out = []
         if t == "user":
             if isinstance(content, list):
                 content = "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
-            text = (content or "").strip() if isinstance(content, str) else ""
-            m = CMD_NAME.match(text)
-            if m:   # a slash command is saved as tags: show it the way it was typed
-                args = CMD_ARGS.search(text)
-                text = m.group(1) + (" " + args.group(1).strip() if args and args.group(1).strip() else "")
-            if text and not text.startswith("<"):
-                out.append(self._add("user", text))
+            text = _typed((content or "").strip() if isinstance(content, str) else "")
+            if text in self.expect:   # the dequeued message written again: it is already in the chat
+                self.expect.remove(text)
+                return []
+            if text and not text.startswith("<"):   # notifications arrive in between; only a real prompt ends the wait
+                self.expect = []
+            if text.startswith("[Request interrupted"):
+                out.append(self._add("note", text, ts))
+            elif text and not text.startswith("<"):
+                out.append(self._add("user", text, ts))
         else:
             for b in content or []:
                 if b.get("type") == "text" and b.get("text", "").strip():
-                    out.append(self._add("assistant", b["text"].strip()))
+                    out.append(self._add("assistant", b["text"].strip(), ts))
                 elif b.get("type") == "tool_use":
-                    out.append(self._add("tool", _tool_line(b)))
+                    out.append(self._add("tool", _tool_line(b), ts))
         return out
 
     def read(self):
@@ -173,7 +227,7 @@ class Tail:
 
 
 def parse_transcript(path):
-    """Claude Code's saved session -> ([{role, text}], title)."""
+    """Claude Code's saved session -> ([{role, text, ts[, state]}], title)."""
     t = Tail(path)
     t.read()
     return t.items, t.title
@@ -228,21 +282,110 @@ def _session_title(agent):
 def parse_menu(text):
     """Find Claude Code's numbered choice list near the bottom of the screen.
 
-    A line '1. x' starts a new list; only the next number extends it; other lines
-    (descriptions, blanks) are skipped. The last list with 2+ options wins.
+    A line '1. x' starts a new list; only the next number extends it. Indented lines right under an
+    option are its description ("detail"); other lines are skipped. The last list with 2+ options wins.
     """
-    found = []
+    found, last = [], None   # last: the option the next indented lines describe
     for raw in text.splitlines()[-40:]:
-        line = ANSI.sub("", raw).strip().strip("│").strip()
+        x = ANSI.sub("", raw).rstrip().rstrip("│").rstrip()
+        if x.lstrip().startswith("│"):   # inside a box: indentation counts from the border
+            x = x.lstrip()[1:]
+        line = x.strip()
         m = MENU_LINE.match(line)
         if not m:
+            if last and line and x[:1].isspace() and not RULE.match(line):
+                last["detail"] = (last.get("detail", "") + " " + line).strip()
+            else:
+                last = None
             continue
         n = int(m.group(1))
         if n == 1:
             found = []
+        last = None
         if n == len(found) + 1:
-            found.append({"n": n, "label": m.group(2).strip()})
+            last = {"n": n, "label": m.group(2).strip()}
+            found.append(last)
     return found if len(found) >= 2 else None
+
+
+SGR = re.compile(r"\x1b\[([0-9;]*)m")
+RULE = re.compile(r"^\s*[─━]{9,}\s*$")
+MENU_PICK = re.compile(r"^\s*❯\s*\d+\.\s")
+SPINNER = re.compile(r"^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✻✽✶✳✢·*]\s+(\S.*)$")
+BLOCK_START = re.compile(r"^(?:[⏺⎿✻※╭]|[●○](?!─)|>\s)")   # "●─ Run 5" is a tool group inside a reply, not a new block
+NORM_DROP = re.compile(r"[⏺●○│╭╰─❯>┃·]")
+
+
+def _has_bg(raw):
+    """True when an SGR code sets a background colour (40-47, 100-107, 48;5;n, 48;2;r;g;b).
+    Walks the parameters in order so a colour value that happens to be 48 is not mistaken for one."""
+    for m in SGR.finditer(raw):
+        ps = [int(p) if p else 0 for p in m.group(1).split(";")]
+        i = 0
+        while i < len(ps):
+            p = ps[i]
+            if 40 <= p <= 47 or 100 <= p <= 107 or p == 48:
+                return True
+            if p in (38, 58):   # foreground / underline colour: skip its values
+                i += 3 if i + 1 < len(ps) and ps[i + 1] == 5 else 5 if i + 1 < len(ps) and ps[i + 1] == 2 else 1
+                continue
+            i += 1
+    return False
+
+
+def _norm(text):
+    return re.sub(r"[^a-z0-9]", "", NORM_DROP.sub("", text).lower())[:24]
+
+
+def live_view(text, items, status):
+    """The part of Claude's screen the transcript cannot have yet: the block being written, the spinner,
+    a menu, the text in Claude's input bar. Everything above that is already in the transcript.
+    -> {"lines": [raw ANSI lines], "working": str|None, "menu": [{n, label}]|None, "input": str}"""
+    raw = [l.rstrip("\r") for l in text.split("\n")]
+    plain = [ANSI.sub("", l).strip() for l in raw]
+    n = len(raw)
+    menu, question, inp, foot = None, [], "", n
+    pick = next((i for i in range(n - 1, -1, -1) if MENU_PICK.match(plain[i].strip("│").strip())), None)
+    if pick is not None and not any(p.startswith("❯") and not MENU_PICK.match(p) for p in plain[pick + 1:]):
+        first = next((i for i in range(pick, -1, -1) if re.match(r"^(?:❯\s*)?1\.\s", plain[i].strip("│").strip())), pick)
+        rule = next((i for i in range(first - 1, max(first - 13, -1), -1) if RULE.match(plain[i])), None)
+        foot = first if rule is None else rule
+        menu = parse_menu("\n".join(raw[foot:]))
+        # the question above the options; the options themselves become buttons from `menu`
+        question = [raw[i] for i in range(foot, first) if plain[i] and not RULE.match(plain[i])]
+    else:
+        prompt = next((i for i in range(n - 1, -1, -1) if plain[i].startswith("❯")), None)
+        if prompt is not None:
+            inp = plain[prompt][1:].strip()
+            foot = prompt - 1 if prompt and RULE.match(plain[prompt - 1]) else prompt
+            i, gap = foot - 1, 0   # Claude Code's status block sits on coloured backgrounds, maybe with blank rows
+            while i >= 0 and gap <= 2:
+                if _has_bg(raw[i]):
+                    foot, gap = i, 0
+                else:
+                    gap += 1
+                i -= 1
+    body = list(range(foot))
+    working = None
+    for i in reversed(body):
+        m = SPINNER.match(plain[i])
+        if m and re.search(r"…|esc to interrupt| tokens|\d+[sm]\b", m.group(1)):
+            w = re.sub(r"\(?\s*esc to interrupt\s*\)?", "", m.group(1))
+            working = " ".join(w.strip().strip("()").split()) or None
+            body.remove(i)
+            break
+    if status in ("idle", "done"):
+        working = None   # "✻ Crunched for 40s" is a finished turn, not a spinner
+    while body and not plain[body[-1]]:
+        body.pop()
+    starts = [k for k, i in enumerate(body) if BLOCK_START.match(plain[i])]
+    block = body[starts[-1]:] if starts else body
+    if block:
+        last = next((it for it in reversed(items[-3:]) if it.get("role") in ("user", "assistant")), None)
+        key = _norm(" ".join(plain[i] for i in block))
+        if status in ("idle", "done") or (last and key and key == _norm(last.get("text", ""))):
+            block = []
+    return {"lines": [raw[i] for i in block] + question, "working": working, "menu": menu, "input": inp}
 
 
 def read_screen(pane, source="recent_unwrapped", fmt="ansi", lines=400):
@@ -377,7 +520,6 @@ def _unzoom(pane):
 
 
 def close_term(term_id):
-    print("TMPLOG %.3f close_term %s" % (time.time(), term_id), file=sys.stderr, flush=True)
     with TERM_OPS:
         with TERMS_LOCK:
             t = TERMS.pop(term_id, None)
@@ -592,12 +734,16 @@ def new_tab(hub, workspace_id, body):
     return pane
 
 
-def session_of(hub, pane):
+def agent_of(hub, pane):
     for w in hub.snapshot()["workspaces"]:
         for a in w["agents"]:
             if a["pane_id"] == pane:
-                return a.get("session")
-    return None
+                return a
+    return {}
+
+
+def session_of(hub, pane):
+    return agent_of(hub, pane).get("session")
 
 
 def _size(body):
@@ -607,12 +753,18 @@ def _size(body):
     return cols, rows
 
 
-def make_handler(hub, owner):
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+WEB_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css",
+             ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml",
+             ".png": "image/png", ".json": "application/json"}
+
+
+def make_handler(hub, owner):   # owner None = --dev: no login check
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, *args):
-            print("TMPLOG %.3f %s" % (time.time(), args[0] % args[1:]), file=sys.stderr, flush=True)
+            pass
 
         def _json(self, code, obj):
             data = json.dumps(obj).encode()
@@ -628,11 +780,25 @@ def make_handler(hub, owner):
         def _authed(self):
             # tailscale serve sets this from the caller's tailnet identity; the bridge only listens on
             # 127.0.0.1, so the header cannot come from anywhere else.
-            if self.headers.get("Tailscale-User-Login") != owner:
+            if owner is not None and self.headers.get("Tailscale-User-Login") != owner:
                 self.close_connection = True  # the request body was not read; do not reuse the connection
                 self._err(403, "forbidden", "this bridge only answers its owner")
                 return False
             return True
+
+        def _static(self, name):
+            # plain file names only: no slashes, so no way out of the web folder
+            path = os.path.join(WEB_DIR, name)
+            if not re.match(r"^[A-Za-z0-9._-]+$", name) or name.startswith("..") or not os.path.isfile(path):
+                return self._err(404, "not_found", name)
+            with open(path, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", WEB_TYPES.get(os.path.splitext(name)[1], "application/octet-stream"))
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache")   # the page updates with the bridge
+            self.end_headers()
+            self.wfile.write(data)
 
         def _body(self):
             n = int(self.headers.get("Content-Length") or 0)
@@ -642,10 +808,15 @@ def make_handler(hub, owner):
             if not self._authed():
                 return
             u = urlparse(self.path)
+            if u.path in ("/", "/index.html"):
+                return self._static("index.html")
+            if u.path.startswith("/web/"):
+                return self._static(u.path[5:])
             if u.path == "/api/state":
                 return self._json(200, hub.snapshot())
             if u.path == "/api/events":
-                return self._events(parse_qs(u.query).get("watch", [None])[0])
+                qs = parse_qs(u.query)
+                return self._events(qs.get("watch", [None])[0], qs.get("v") == ["2"], qs.get("screen") == ["1"])
             parts = u.path.strip("/").split("/")
             if len(parts) == 4 and parts[:2] == ["api", "agents"] and parts[3] == "history":
                 try:
@@ -809,7 +980,10 @@ def make_handler(hub, owner):
             self.wfile.write(("event: %s\ndata: %s\n\n" % (event, json.dumps(data))).encode())
             self.wfile.flush()
 
-        def _events(self, watch):
+        def _events(self, watch, v2=False, want_screen=False):
+            # v2 (web chat, iPhone app from Part 3): history carries the item's index, and `live` replaces
+            # the raw screen, which is only sent when asked (screen=1): the spinner redraws it 5 times a
+            # second, too much for mobile data. v1 (current iPhone app): history and screen as before.
             # No Content-Length: the body runs until the connection closes, which is valid HTTP/1.1.
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -819,6 +993,7 @@ def make_handler(hub, owner):
             q = hub.subscribe(watch)
             last, next_ping = None, time.time() + 15
             tail, session = None, False   # False: not looked up yet (None is a real answer: a plain shell)
+            status, last_live = None, None
 
             def full():
                 self._sse("history_full", {"pane_id": watch, "items": tail.items[-500:], "title": tail.title})
@@ -834,9 +1009,11 @@ def make_handler(hub, owner):
                             text = read_screen(watch)
                         except (HerdrError, OSError, ValueError, KeyError):
                             text = None
-                        if text is not None and text != last:
+                        changed = text is not None and text != last
+                        if changed:
                             last = text
-                            self._sse("screen", {"pane_id": watch, "text": text})
+                            if not v2 or want_screen:
+                                self._sse("screen", {"pane_id": watch, "text": text})
                         # Claude Code appends each message to its transcript the moment it happens. Follow
                         # that file (one stat per tick, on this computer; nothing crosses the network unless
                         # it grew) and push new entries at once, instead of the phone re-fetching on timers.
@@ -846,18 +1023,38 @@ def make_handler(hub, owner):
                                 session, tail = sid, Tail(session=sid)
                                 tail.read()
                                 full()
+                                changed = True
                             else:
+                                size = len(tail.items)
                                 new = tail.read()
                                 if new is None:   # file replaced or truncated: send it whole again
                                     tail.read()
                                     full()
+                                    changed = True
                                 else:
                                     for ev in new:
-                                        self._sse("history", {"pane_id": watch, "item": ev["item"], "replace_last": ev["replace_last"]})
+                                        changed = True   # the last item may now be what the screen shows
+                                        append = ev["index"] == size
+                                        size += append
+                                        if v2:
+                                            self._sse("history", dict(ev, pane_id=watch))
+                                        elif append or ev["replace_last"]:   # v1 cannot place an earlier-item update
+                                            self._sse("history", {"pane_id": watch, "item": ev["item"], "replace_last": ev["replace_last"]})
                         except (BrokenPipeError, ConnectionResetError):
                             raise   # the phone went away: stop the stream
                         except OSError:
                             pass    # transcript file mid-rename or unreadable: try again next tick
+                        now = agent_of(hub, watch).get("status", "unknown")
+                        if v2 and last is not None and (changed or now != status):
+                            status = now
+                            try:
+                                live = dict(live_view(last, tail.items if tail else [], status), pane_id=watch)
+                            except Exception:   # a screen layout we did not foresee must not end the stream
+                                traceback.print_exc()
+                                live = last_live
+                            if live != last_live:
+                                last_live = live
+                                self._sse("live", live)
                     try:
                         kind, data = q.get(timeout=0.2)
                         if kind == "kick":
@@ -920,6 +1117,8 @@ CONFIG = os.path.join(HOME, ".herdr-remote", "config.json")
 def main():
     ap = argparse.ArgumentParser(description="Herdr Remote bridge")
     ap.add_argument("--owner", help="your Tailscale login, e.g. you@gmail.com (saved to config)")
+    ap.add_argument("--dev", action="store_true",
+                    help="no Tailscale login check (127.0.0.1 only), for testing the web client in a local browser")
     ap.add_argument("--port", type=int, help="local port (default 8795)")
     ap.add_argument("--owner-from-status", action="store_true",
                     help="read `tailscale status --json` on stdin, print the signed-in login, exit")
@@ -945,7 +1144,7 @@ def main():
         os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
         with open(CONFIG, "w") as f:
             json.dump(cfg, f, indent=2)
-    if not cfg.get("owner"):
+    if not args.dev and not cfg.get("owner"):
         sys.exit("Set your Tailscale login once: herdr_remote.py --owner you@gmail.com")
     try:
         info = call("ping")
@@ -957,8 +1156,11 @@ def main():
     threading.Thread(target=hub.run, daemon=True).start()
     threading.Thread(target=reap_loop, daemon=True).start()
     port = cfg.get("port", 8795)
-    srv = make_server(hub, cfg["owner"], port)
-    print("herdr-remote bridge on 127.0.0.1:%d for %s" % (port, cfg["owner"]), flush=True)
+    owner = None if args.dev else cfg["owner"]
+    if args.dev:
+        print("dev mode: no login check (127.0.0.1 only)", file=sys.stderr, flush=True)
+    srv = make_server(hub, owner, port)
+    print("herdr-remote bridge on 127.0.0.1:%d for %s" % (port, owner or "anyone (dev)"), flush=True)
     srv.serve_forever()
 
 

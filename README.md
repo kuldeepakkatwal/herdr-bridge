@@ -27,6 +27,8 @@ curl -fsSL https://raw.githubusercontent.com/kuldeepakkatwal/herdr-bridge/main/i
 
 On Linux, the installer may ask for your password once. That lets your user publish the bridge through Tailscale.
 
+Open the bridge address in a browser to get the web chat.
+
 That is it. If something goes wrong, the installer prints one sentence saying what to fix. Fix it and paste the line again.
 
 ## Update
