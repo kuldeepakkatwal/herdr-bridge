@@ -313,6 +313,7 @@ RULE = re.compile(r"^\s*[─━]{9,}\s*$")
 MENU_PICK = re.compile(r"^\s*❯\s*\d+\.\s")
 SPINNER = re.compile(r"^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✻✽✶✳✢·*]\s+(\S.*)$")
 BLOCK_START = re.compile(r"^(?:[⏺⎿✻※╭]|[●○](?!─)|>\s)")   # "●─ Run 5" is a tool group inside a reply, not a new block
+SUGGESTION = re.compile(r"^/[A-Za-z0-9:._-]+(\s{2,}|$)")
 NORM_DROP = re.compile(r"[⏺●○│╭╰─❯>┃·]")
 
 
@@ -340,7 +341,10 @@ def _norm(text):
 def live_view(text, items, status):
     """The part of Claude's screen the transcript cannot have yet: the block being written, the spinner,
     a menu, the text in Claude's input bar. Everything above that is already in the transcript.
-    -> {"lines": [raw ANSI lines], "working": str|None, "menu": [{n, label}]|None, "input": str}"""
+    footer: Claude's input-bar region as drawn (suggestions, status block, bar, mode lines), or the whole
+    menu; clients that draw their own bar or buttons ignore it.
+    -> {"lines": [raw ANSI lines], "working": str|None, "menu": [{n, label[, detail]}]|None, "input": str,
+        "footer": [raw ANSI lines]}"""
     raw = [l.rstrip("\r") for l in text.split("\n")]
     plain = [ANSI.sub("", l).strip() for l in raw]
     n = len(raw)
@@ -365,6 +369,11 @@ def live_view(text, items, status):
                 else:
                     gap += 1
                 i -= 1
+            i = foot - 1   # the slash-command list Claude draws above it, with its wrapped descriptions
+            while i >= 0 and (SUGGESTION.match(plain[i]) or (plain[i] and re.match(r"^ {8,}\S", ANSI.sub("", raw[i])))):
+                if SUGGESTION.match(plain[i]):
+                    foot = i
+                i -= 1
     body = list(range(foot))
     working = None
     for i in reversed(body):
@@ -385,7 +394,11 @@ def live_view(text, items, status):
         key = _norm(" ".join(plain[i] for i in block))
         if status in ("idle", "done") or (last and key and key == _norm(last.get("text", ""))):
             block = []
-    return {"lines": [raw[i] for i in block] + question, "working": working, "menu": menu, "input": inp}
+    footer = raw[foot:]
+    while footer and not ANSI.sub("", footer[-1]).strip():
+        footer.pop()
+    return {"lines": [raw[i] for i in block] + question, "working": working, "menu": menu, "input": inp,
+            "footer": footer}
 
 
 def read_screen(pane, source="recent_unwrapped", fmt="ansi", lines=400):
