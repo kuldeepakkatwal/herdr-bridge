@@ -1,9 +1,10 @@
-/* Herdr web chat. Phone first; a left sidebar instead of the drawer from 900 px. */
+/* Herdr web chat, drawn like Claude Code in the terminal. Phone first; a left sidebar from 900 px. */
 :root {
   --bg: #ffffff; --fg: #1c1c1e; --mut: #6e6e73; --faint: #aeaeb2;
   --soft: #f2f2f7; --soft2: #e5e5ea; --tint: #e8f0fe; --line: rgba(0, 0, 0, .08);
   --accent: #1f6feb; --on-accent: #ffffff;
   --idle: #8e8e93; --working: #1f6feb; --blocked: #e8820c; --done: #2fa84f; --bad: #d93025;
+  --bullet: #2e9e4f; --strip: rgba(0, 0, 0, .045); --spin: #c2613a;
   --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   color-scheme: light dark;
@@ -13,6 +14,7 @@
     --bg: #161618; --fg: #f2f2f7; --mut: #98989d; --faint: #636366;
     --soft: #232326; --soft2: #2e2e32; --tint: #2a3b5c; --line: rgba(255, 255, 255, .09);
     --accent: #4c8dff; --idle: #8e8e93; --working: #4c8dff; --blocked: #ff9f0a; --done: #32d74b; --bad: #ff6961;
+    --bullet: #4eba65; --strip: rgba(255, 255, 255, .06); --spin: #d97757;
   }
 }
 
@@ -43,91 +45,83 @@ button { font: inherit; color: inherit; border: 0; background: none; cursor: poi
 .pill.done { color: var(--done); background: color-mix(in srgb, var(--done) 15%, transparent); }
 .pill.offline { color: var(--bad); background: color-mix(in srgb, var(--bad) 13%, transparent); }
 
-/* Message list */
+/* Message list: Claude Code's rows */
 .listwrap { flex: 1; min-height: 0; position: relative; }
 #list { position: absolute; inset: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
-  padding: 12px calc(16px + env(safe-area-inset-right)) 16px calc(16px + env(safe-area-inset-left)); }
-#msgs, #pending { display: flex; flex-direction: column; gap: 14px; }
-#pending:not(:empty) { margin-top: 14px; }
-.msg { min-width: 0; max-width: 100%; }
-.empty { color: var(--mut); text-align: center; margin: 30vh 0 0; font-size: 15px; }
+  padding: 12px calc(14px + env(safe-area-inset-right)) 14px calc(14px + env(safe-area-inset-left));
+  font: 13px/1.5 var(--mono); }
+#msgs, #pending { display: flex; flex-direction: column; gap: 12px; }
+#pending:not(:empty) { margin-top: 12px; }
+.empty { color: var(--mut); text-align: center; margin: 30vh 0 0; }
+.dim { color: var(--mut); font-weight: 400; }
 
-.user { align-self: flex-end; max-width: 85%; display: flex; flex-direction: column; align-items: flex-end; }
-.bubble { background: var(--tint); border-radius: 18px; padding: 9px 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.meta { font-size: 11px; color: var(--mut); margin: 3px 6px 0; }
-.user.queued { opacity: .7; }
-.user.queued .meta b { font-weight: 600; color: var(--blocked); margin-left: 6px; }
+/* every row: a 2-character gutter for its mark (❯ ⏺ ⎿), text hangs after it */
+.row { display: grid; grid-template-columns: 2ch minmax(0, 1fr); min-width: 0; }
+.mark { user-select: none; }
+.text { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
+.user { background: var(--strip); border-radius: 6px; padding: 5px 8px 5px 6px; font-weight: 600; }
+.user .mark { color: var(--mut); }
+.user.queued, .user.sending { opacity: .7; }
 .user.dropped { opacity: .5; }
-.user.dropped .meta b { font-weight: 600; color: var(--bad); margin-left: 6px; }
-.user.sending .meta { font-style: italic; }
+.asst .mark { color: var(--bullet); }
+.tool { display: block; color: var(--mut); padding-left: 2ch; }
+.tline { display: grid; grid-template-columns: 2.5ch minmax(0, 1fr); }
+.note { display: block; text-align: center; color: var(--mut); font-size: 12px; }
 
-.note { align-self: center; text-align: center; color: var(--mut); font-size: 13px; padding: 0 12px; }
-
-.tool { align-self: flex-start; max-width: 100%; background: var(--soft); border-radius: 12px; padding: 7px 12px;
-  color: var(--mut); font: 12.5px/1.45 var(--mono); }
-.tool.one { white-space: pre-wrap; overflow-wrap: anywhere; }
-.tool summary { cursor: pointer; font-family: var(--sans); font-size: 13px; list-style: none; user-select: none; }
-.tool summary::-webkit-details-marker { display: none; }
-.tool summary::before { content: "›"; display: inline-block; width: 12px; transition: transform .15s; }
-.tool[open] summary::before { transform: rotate(90deg); }
-.tool .lines { margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
-
-/* Assistant markdown */
-.md { overflow-wrap: anywhere; }
+/* Assistant markdown, all monospace */
+.md { overflow-wrap: anywhere; min-width: 0; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
-.md p, .md ul, .md ol, .md blockquote, .md pre, .md .scrollx { margin: 0 0 .65em; }
-.md ul, .md ol { padding-left: 1.4em; }
-.md li + li { margin-top: .2em; }
-.md h1, .md h2, .md h3, .md h4 { line-height: 1.3; margin: 1em 0 .4em; }
-.md h1 { font-size: 1.3em; } .md h2 { font-size: 1.18em; } .md h3, .md h4 { font-size: 1.05em; }
-.md a { color: var(--accent); text-decoration: none; }
-.md a:hover { text-decoration: underline; }
-.md blockquote { padding-left: 12px; border-left: 3px solid var(--soft2); color: var(--mut); margin-left: 0; }
-.md hr { border: 0; height: 1px; background: var(--line); margin: 1em 0; }
-.md code { font: .84em/1.4 var(--mono); background: var(--soft); border-radius: 5px; padding: .1em .35em; }
-.md pre { background: var(--soft); border-radius: 12px; padding: 10px 12px; overflow-x: auto; overflow-wrap: normal; }
-.md pre code { font-size: 12.5px; line-height: 1.5; background: none; padding: 0; white-space: pre; }
+.md p, .md ul, .md ol, .md blockquote, .md pre, .md .scrollx { margin: 0 0 10px; }
+.md ul, .md ol { padding-left: 2.5ch; }
+.md h1, .md h2, .md h3, .md h4 { font-size: 1em; font-weight: 700; margin: 12px 0 6px; }
+.md a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.md blockquote { padding-left: 1.5ch; border-left: 2px solid var(--soft2); color: var(--mut); margin-left: 0; }
+.md hr { border: 0; height: 1px; background: var(--line); margin: 10px 0; }
+.md code { font: inherit; color: var(--spin); }
+.md pre { background: var(--soft); border-radius: 6px; padding: 8px 10px; overflow-x: auto; overflow-wrap: normal; }
+.md pre code { color: inherit; white-space: pre; }
 .md img { max-width: 100%; }
 .scrollx { overflow-x: auto; max-width: 100%; }
-.md table { border-collapse: collapse; font-size: 14.5px; overflow-wrap: normal; }
-.md th, .md td { padding: 6px 12px 6px 0; text-align: left; border-bottom: 0.5px solid var(--line); vertical-align: top; }
-.md th { font-weight: 600; border-bottom-color: var(--soft2); }
+.md table { border-collapse: collapse; overflow-wrap: normal; }
+.md th, .md td { padding: 3px 1.5ch 3px 0; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+.md th { font-weight: 700; }
 
-/* Live block: what Claude is drawing right now */
-#live { margin-top: 14px; }
-#liveLines { margin: 0 0 8px; background: var(--soft); border-radius: 12px; padding: 10px 12px; opacity: .78;
-  font: 12.5px/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
-#liveLines .clip { white-space: pre; overflow: hidden; }
-#working { color: var(--mut); font-size: 13px; display: flex; align-items: center; gap: 2px; }
-#workingText { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.dots { display: inline-flex; gap: 3px; margin-right: 6px; }
-.dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--working); animation: blink 1.2s infinite ease-in-out; }
-.dots i:nth-child(2) { animation-delay: .2s; } .dots i:nth-child(3) { animation-delay: .4s; }
-@keyframes blink { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
-@media (prefers-reduced-motion: reduce) { .dots i { animation: none; opacity: .7; } }
+/* Live block: Claude's current block as drawn, then the spinner line */
+#live { margin-top: 12px; }
+#liveLines div, #bar div { min-height: 1lh; }
+#liveLines div { white-space: pre-wrap; overflow-wrap: anywhere; }
+#liveLines .clip, #bar .clip { white-space: pre; overflow: hidden; }
+#working { color: var(--spin); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 #newPill { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); background: var(--accent); color: var(--on-accent);
   font-size: 13px; font-weight: 600; padding: 7px 14px; border-radius: 999px; box-shadow: 0 2px 10px rgba(0, 0, 0, .18); }
 
-/* Bottom: menu options, keys, message box */
+/* Bottom: Claude's bar (suggestions, status block, ❯ line, mode lines, or a menu), then keys */
 #bottom { flex: none; border-top: 0.5px solid var(--line); background: var(--bg);
-  padding: 8px calc(12px + env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left)); }
-#menu { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; max-height: 38vh; overflow-y: auto; }
-.opt { text-align: left; background: var(--soft); border-radius: 12px; padding: 10px 14px; min-height: 44px; font-size: 15px; }
-.opt { display: flex; align-items: baseline; gap: 8px; }
-.opt b { color: var(--accent); flex: none; }
-.opt-text { display: flex; flex-direction: column; min-width: 0; }
-.opt .detail { font-size: 13px; color: var(--mut); line-height: 1.35; margin-top: 1px; }
-.opt:active, .key:active { background: var(--soft2); }
-#keys { display: flex; gap: 6px; margin-bottom: 8px; }
+  padding: 6px calc(12px + env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left)); }
+#bar { font: 12px/1.45 var(--mono); margin-bottom: 8px; max-height: 50vh; overflow-y: auto; overflow-x: hidden; }
+#bar .sugg { white-space: pre-wrap; overflow-wrap: anywhere; cursor: pointer; border-radius: 4px; }
+#bar .sugg:hover { background: var(--soft); }
+#inputRow { display: flex; align-items: center; gap: 8px; min-height: 44px; }
+#lineWrap { flex: 1; min-width: 0; position: relative; }
+#drawn { white-space: pre-wrap; overflow-wrap: anywhere; cursor: text; }
+#edit { display: grid; grid-template-columns: 2ch minmax(0, 1fr); align-items: start; }
+#edit .mark { font-size: 12px; line-height: 22px; }
+/* the box is 16 px so iOS does not zoom when it gets focus */
+#box { resize: none; border: 0; outline: none; background: transparent; color: var(--fg); padding: 0; margin: 0;
+  font: 16px/22px var(--mono); overflow-y: auto; }
+/* not typing: the box lies invisibly over Claude's drawn ❯ line, so a tap lands in it and the keyboard comes up */
+#inputRow:not(.typing):not(.nodrawn) #edit { position: absolute; inset: 0; opacity: 0; }
+#inputRow:not(.typing):not(.nodrawn) #box { height: 100% !important; }
+#inputRow.typing #drawn, #inputRow.nodrawn #drawn { display: none; }
+#send { flex: none; width: 44px; height: 44px; border-radius: 50%; background: var(--accent); color: var(--on-accent);
+  display: grid; place-items: center; }
+#keys { display: flex; gap: 6px; }
 .key { flex: 1; min-width: 0; height: 38px; border-radius: 10px; background: var(--soft); font: 600 13px var(--mono); color: var(--fg); }
 .key.primary { background: var(--accent); color: var(--on-accent); font-family: var(--sans); flex: 1.6; }
-#composer { display: flex; align-items: flex-end; gap: 8px; }
-#box { flex: 1; min-width: 0; resize: none; border: 0; outline: none; background: var(--soft); color: var(--fg);
-  font: 16px/22px var(--sans); padding: 11px 16px; border-radius: 22px; max-height: 154px; }
-#box:focus { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
-#send { flex: none; height: 44px; min-width: 44px; padding: 0 18px; border-radius: 22px; background: var(--accent); color: var(--on-accent); font-weight: 600; font-size: 15px; }
+.key:active { background: var(--soft2); }
+.key.primary:active { opacity: .85; }
 #send:disabled, .key:disabled { opacity: .45; cursor: default; }
 
 /* Drawer (phone) / sidebar (wide) */

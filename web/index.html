@@ -38,8 +38,8 @@
           <div id="msgs"></div>
           <div id="pending"></div>
           <div id="live" hidden>
-            <pre id="liveLines"></pre>
-            <div id="working"><span class="dots"><i></i><i></i><i></i></span> Claude is working<span id="workingText"></span></div>
+            <div id="liveLines"></div>
+            <div id="working"></div>
           </div>
         </div>
       </section>
@@ -47,12 +47,20 @@
     </div>
     <footer id="bottom">
       <div class="col">
-        <div id="menu" hidden></div>
+        <div id="bar">
+          <div id="barAbove"></div>
+          <div id="inputRow" class="nodrawn">
+            <div id="lineWrap">
+              <div id="drawn"></div>
+              <div id="edit"><span class="mark">❯</span><textarea id="box" rows="1" enterkeyhint="send" autocomplete="off" spellcheck="false" aria-label="Claude's input bar"></textarea></div>
+            </div>
+            <button id="send" type="button" aria-label="Send">
+              <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+            </button>
+          </div>
+          <div id="barBelow"></div>
+        </div>
         <div id="keys"></div>
-        <form id="composer">
-          <textarea id="box" rows="1" placeholder="Message Claude" enterkeyhint="send" autocomplete="off"></textarea>
-          <button id="send" type="submit">Send</button>
-        </form>
       </div>
     </footer>
   </main>

@@ -313,7 +313,7 @@ RULE = re.compile(r"^\s*[─━]{9,}\s*$")
 MENU_PICK = re.compile(r"^\s*❯\s*\d+\.\s")
 SPINNER = re.compile(r"^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✻✽✶✳✢·*]\s+(\S.*)$")
 BLOCK_START = re.compile(r"^(?:[⏺⎿✻※╭]|[●○](?!─)|>\s)")   # "●─ Run 5" is a tool group inside a reply, not a new block
-SUGGESTION = re.compile(r"^/[A-Za-z0-9:._-]+(\s{2,}|$)")
+SUGGESTION = re.compile(r"^(?:❯\s*)?/[A-Za-z0-9:._-]+(?:\s+\([^)]*\))?(\s{2,}|$)")   # ❯: the selected row
 NORM_DROP = re.compile(r"[⏺●○│╭╰─❯>┃·]")
 
 
@@ -332,6 +332,22 @@ def _has_bg(raw):
                 continue
             i += 1
     return False
+
+
+def _undimmed(raw):
+    """The visible text without the parts drawn dim (SGR 2): Claude's empty-bar placeholder is dim."""
+    out, dim = [], False
+    for tok in re.split(r"(\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07)", raw):
+        m = SGR.fullmatch(tok)
+        if m:
+            for p in (m.group(1) or "0").split(";"):
+                if p in ("", "0", "22"):
+                    dim = False
+                elif p == "2":
+                    dim = True
+        elif not tok.startswith("\x1b") and not dim:
+            out.append(tok)
+    return "".join(out)
 
 
 def _norm(text):
@@ -360,7 +376,7 @@ def live_view(text, items, status):
     else:
         prompt = next((i for i in range(n - 1, -1, -1) if plain[i].startswith("❯")), None)
         if prompt is not None:
-            inp = plain[prompt][1:].strip()
+            inp = _undimmed(raw[prompt]).strip()[1:].strip()
             foot = prompt - 1 if prompt and RULE.match(plain[prompt - 1]) else prompt
             i, gap = foot - 1, 0   # Claude Code's status block sits on coloured backgrounds, maybe with blank rows
             while i >= 0 and gap <= 2:

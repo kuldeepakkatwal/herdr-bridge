@@ -15,11 +15,12 @@
  *   OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  *   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  *
- * The bridge does all the merging (transcript + screen); this page only renders what it sends:
+ * Drawn like Claude Code in the terminal. The bridge does all the merging (transcript + screen); this page only renders what it sends:
  *   state         {herdr, workspaces:[{id,label,path,agents:[{pane_id,title,status,menu,...}]}]}
  *   history_full  {pane_id, items, title}            replaces the list
  *   history       {pane_id, item, index, replace_last} append when index == length, else replace at index
- *   live          {pane_id, lines, working, menu, input}  what Claude is drawing right now
+ *   live          {pane_id, lines, working, menu, input, footer}  what Claude is drawing right now; footer = its
+ *                 input-bar region (suggestions, status block, ❯ line, mode lines) or the whole menu
  */
 'use strict';
 
@@ -27,8 +28,8 @@ const $ = (id) => document.getElementById(id);
 const E = {
   app: $('app'), agents: $('agents'), scrim: $('scrim'), menuBtn: $('menuBtn'), title: $('title'), sub: $('sub'),
   pill: $('pill'), conn: $('conn'), list: $('list'), msgs: $('msgs'), pending: $('pending'), live: $('live'),
-  liveLines: $('liveLines'), working: $('working'), workingText: $('workingText'), newPill: $('newPill'),
-  menu: $('menu'), keys: $('keys'), composer: $('composer'), box: $('box'), send: $('send'), toast: $('toast'),
+  liveLines: $('liveLines'), working: $('working'), newPill: $('newPill'), keys: $('keys'), toast: $('toast'),
+  barAbove: $('barAbove'), barBelow: $('barBelow'), inputRow: $('inputRow'), drawn: $('drawn'), box: $('box'), send: $('send'),
 };
 
 function load(k) { try { return localStorage.getItem(k); } catch { return null; } }
@@ -42,7 +43,8 @@ const S = {
   es: null, retry: 1000, retryTimer: 0,
   fresh: true,            // next history_full jumps to the bottom
   stuck: true,
-  menuSig: '', keySig: '', liveSig: '',
+  barSig: '', keySig: '', liveSig: '',
+  barText: '',            // what Claude's bar holds, read from its drawn ❯ line
 };
 
 function h(tag, cls, text) {
@@ -138,6 +140,21 @@ function span(text, st) {
 
 const BOX_ONLY = /^[\s─━│┃╭╮╰╯┌┐└┘├┤┬┴┼═║╔╗╚╝]*[─━═][\s─━│┃╭╮╰╯┌┐└┘├┤┬┴┼═║╔╗╚╝]*$/;
 const ESC_RE = /\x1b\[([0-9;:?<=>]*)[ -/]*([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[^[\]]?/g;
+// The text in Claude's bar from its drawn ❯ line. Dim text is Claude's placeholder hint ("Try …"), not input.
+function barText(line) {
+  line = line.replace(/\r/g, '');
+  let st = {}, out = '', last = 0, m;
+  const keep = (t) => { if (!st.dim) out += t; };
+  ESC_RE.lastIndex = 0;
+  while ((m = ESC_RE.exec(line))) {
+    keep(line.slice(last, m.index));
+    last = ESC_RE.lastIndex;
+    if (m[2] === 'm') st = sgr(m[1], st);
+  }
+  keep(line.slice(last));
+  return out.replace(/^\s*❯[\s\u00a0]?/, '').replace(/[\s\u00a0]+$/, '');
+}
+
 function ansiHtml(line) {
   line = line.replace(/\r/g, '');
   let st = {}, out = '', last = 0, m;
@@ -192,42 +209,38 @@ function sendKeys(keys) {
   post('keys', { keys }).catch((e) => toast('Key not sent: ' + e.message));
 }
 
-/* ---------- messages ---------- */
-
-function hhmm(ts) {
-  if (!ts) return '';
-  const d = new Date(ts);
-  return isNaN(d) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
-}
+/* ---------- messages, drawn like Claude Code ---------- */
 
 // state: undefined/'sent' = plain, 'queued' = Claude has not taken it yet, 'dropped' = removed before Claude took it
-const USER_LABEL = { queued: 'Queued', dropped: 'Not sent' };
-function userNode(text, ts, state, sending) {
-  const n = h('div', 'msg user' + (USER_LABEL[state] ? ' ' + state : '') + (sending ? ' sending' : ''));
-  n.append(h('div', 'bubble', text));
-  const meta = h('div', 'meta', sending ? 'Sending…' : hhmm(ts));
-  if (USER_LABEL[state]) meta.append(h('b', null, USER_LABEL[state]));
-  if (meta.textContent) n.append(meta);
+const USER_SUFFIX = { queued: 'queued', dropped: 'not sent', sending: 'sending…' };
+function userNode(text, state) {
+  const n = h('div', 'row user' + (USER_SUFFIX[state] ? ' ' + state : ''));
+  const body = h('span', 'text', text);
+  if (USER_SUFFIX[state]) body.append(h('span', 'dim', ' · ' + USER_SUFFIX[state]));
+  n.append(h('span', 'mark', '❯'), body);
   return n;
 }
 
-function itemNode(it, old) {
+function itemNode(it) {
   const text = it.text || '';
-  if (it.role === 'user') return userNode(text, it.ts, it.state, false);
+  if (it.role === 'user') return userNode(text, it.state);
   if (it.role === 'assistant') {
-    const n = h('div', 'msg md');
-    n.innerHTML = mdHtml(text);
+    const n = h('div', 'row asst');
+    const md = h('div', 'md');
+    md.innerHTML = mdHtml(text);
+    n.append(h('span', 'mark', '⏺'), md);
     return n;
   }
   if (it.role === 'tool') {
-    const lines = text.split('\n').filter(Boolean);
-    if (lines.length <= 1) return h('div', 'msg tool one', text);
-    const n = h('details', 'msg tool');
-    n.open = !!(old && old.open);   // a tool row that grows keeps its open/closed state
-    n.append(h('summary', null, `${lines.length} steps`), h('div', 'lines', lines.join('\n')));
+    const n = h('div', 'row tool');
+    for (const line of text.split('\n').filter(Boolean)) {
+      const r = h('div', 'tline');
+      r.append(h('span', 'mark', '⎿'), h('span', 'text', line));
+      n.append(r);
+    }
     return n;
   }
-  return h('div', 'msg note', text);
+  return h('div', 'row note', text);
 }
 
 function renderAll() {
@@ -256,81 +269,227 @@ function applyItem(d) {
     if (it.role === 'user') dropPending();
     if (!stick) E.newPill.hidden = false;
   } else {
-    const n = itemNode(it, S.nodes[i]);
+    const n = itemNode(it);
     S.nodes[i].replaceWith(n);
     S.items[i] = it; S.nodes[i] = n;
   }
   if (stick) toBottom();
 }
 
-/* ---------- optimistic "Sending…" bubbles ---------- */
-
 function dropPending() {
   const n = E.pending.firstElementChild;
   if (n) { clearTimeout(n._t); n.remove(); }
 }
 
-function send() {
-  const text = E.box.value.trim();
-  if (!text || !S.pane) return;
-  E.box.value = '';
-  grow();
-  const n = userNode(text, null, null, true);
-  n._t = setTimeout(() => n.remove(), 3000);   // the real item is on its way (or the send failed: toast below)
+function showSending(text) {
+  const n = userNode(text, 'sending');
+  n._t = setTimeout(() => n.remove(), 3000);   // the real item is on its way
   E.pending.append(n);
   toBottom();
-  post('send', { text }).catch((e) => {
-    clearTimeout(n._t); n.remove();
-    toast('Not sent: ' + e.message);
-    if (!E.box.value) { E.box.value = text; grow(); }   // give the text back so nothing is lost
-  });
 }
 
-/* ---------- live block, menu, keys ---------- */
+/* ---------- live block: Claude's current block, drawn as on the Mac ---------- */
+
+function linesHtml(lines, cls) {
+  // a line of only box drawing (Claude's ╭───╮ frames and rules) is clipped at the edge, not wrapped
+  return lines.map((l) => {
+    const c = BOX_ONLY.test(l.replace(ESC_RE, '')) ? 'clip' : cls;
+    return `<div${c ? ` class="${c}"` : ''}>${ansiHtml(l) || ' '}</div>`;
+  }).join('');
+}
 
 function renderLive() {
   const L = S.live, a = agent();
-  const lines = (L && L.lines) || [];
+  const lines = L && !L.menu ? (L.lines || []) : [];   // a menu is drawn in the bar instead
   let working = L ? L.working : null;
-  if (!L && a && a.status === 'working') working = '';   // a bridge without `live`: still say Claude works
+  if (!L && a && a.status === 'working') working = 'working…';   // a bridge without `live`
   const sig = JSON.stringify([lines, working]);
   if (sig === S.liveSig) return;
   S.liveSig = sig;
   const stick = atBottom();
-  E.live.hidden = !lines.length && working == null;
+  E.live.hidden = !lines.length && !working;
   E.liveLines.hidden = !lines.length;
-  // one div per line; a line of only box drawing (Claude's ╭───╮ frames) is clipped at the edge, not wrapped
-  E.liveLines.innerHTML = lines.map((l) => {
-    const rule = BOX_ONLY.test(l.replace(ESC_RE, '')) ? ' class="clip"' : '';
-    return `<div${rule}>${ansiHtml(l) || ' '}</div>`;
-  }).join('');
-  E.working.hidden = working == null;
-  E.workingText.textContent = working ? '\u00a0· ' + working : '';   // nbsp: a leading space collapses in a flex item
+  E.liveLines.innerHTML = linesHtml(lines);
+  E.working.hidden = !working;
+  E.working.textContent = working ? '✻ ' + working : '';
   if (stick) toBottom();
 }
+
+/* ---------- Claude's bar: suggestions, status block, the ❯ line, mode lines, or a menu ---------- */
+
+// a slash-command suggestion row; the selected one starts with "❯ ", some carry an alias: "/usage (stats)"
+const SUGGEST = /^(?:❯\s*)?\/[A-Za-z0-9:._-]+(?:\s+\([^)]*\))?(\s{2,}|$)/;
+
+function renderBar() {
+  const L = S.live;
+  const footer = (L && L.footer) || [];
+  const sig = JSON.stringify(footer);
+  if (sig === S.barSig) return;
+  S.barSig = sig;
+  const plain = footer.map((l) => l.replace(ESC_RE, ''));
+  // Claude's own ❯ line (a menu's "❯ 1. Yes" is an option, not the bar)
+  const prompt = L && L.menu ? -1 : plain.map((p) => p.trim().startsWith('❯')).lastIndexOf(true);
+  const html = (from, to) => {
+    let out = '', cmd = '';
+    for (let i = from; i < to; i++) {
+      const p = plain[i].trim();
+      if (SUGGEST.test(p)) cmd = p.replace(/^❯\s*/, '').split(/\s/)[0];
+      else if (!/^ {8,}\S/.test(plain[i])) cmd = '';   // a suggestion's wrapped description keeps its command
+      const c = BOX_ONLY.test(plain[i]) || !cmd ? 'clip' : 'sugg';
+      // a suggestion's column padding is drawn for the Mac width: at phone width keep two spaces of it
+      const line = c === 'sugg' ? footer[i].replace(/^ {8,}/, '      ').replace(/(\S) {3,}/g, '$1  ') : footer[i];
+      out += `<div class="${c}"${cmd ? ` data-cmd="${escHtml(cmd)}"` : ''}>${ansiHtml(line) || ' '}</div>`;
+    }
+    return out;
+  };
+  E.barAbove.innerHTML = html(0, prompt < 0 ? footer.length : prompt);
+  E.barBelow.innerHTML = prompt < 0 ? '' : html(prompt + 1, footer.length);
+  E.drawn.innerHTML = prompt < 0 ? '' : ansiHtml(footer[prompt]);
+  S.barText = prompt < 0 ? '' : barText(footer[prompt]);
+  E.inputRow.classList.toggle('nodrawn', prompt < 0);
+  E.inputRow.hidden = !!(L && L.menu);   // a menu takes keys, not text
+}
+
+// Tap a suggestion: the bar gets that command and a space, as if typed.
+E.barAbove.addEventListener('click', (e) => {
+  const row = e.target.closest('[data-cmd]');
+  if (!row) return;
+  E.box.value = row.dataset.cmd + ' ';
+  E.box.focus();
+  E.box.setSelectionRange(E.box.value.length, E.box.value.length);
+  mirror();
+});
+
+/* ---------- typing into Claude's bar ---------- */
+
+// --- planEdits: port of the iPhone app's InputSync (tested by inputsync.test.js) ---
+/** Claude's bar holds `old` with its cursor at `oc`; return the edits that make it hold `nw` with the cursor
+ * at `nc`, editing in place: arrows to the spot, backspace what went, type what came. Positions count
+ * code points. Rejected: "delete back to the first difference and retype" (garbles the bar when the cursor
+ * was moved mid-text). */
+function planEdits(old, oc, nw, nc) {
+  const o = [...old], n = [...nw], out = [];
+  let caret = Math.min(oc, o.length);
+  const move = (t) => {
+    if (t > caret) out.push({ keys: Array(t - caret).fill('right') });
+    if (t < caret) out.push({ keys: Array(caret - t).fill('left') });
+    caret = t;
+  };
+  if (old !== nw) {
+    let p = 0;
+    while (p < o.length && p < n.length && o[p] === n[p]) p++;
+    let s = 0;
+    while (s < o.length - p && s < n.length - p && o[o.length - 1 - s] === n[n.length - 1 - s]) s++;
+    const removed = o.length - p - s;
+    move(p + removed);
+    if (removed > 0) out.push({ keys: Array(removed).fill('backspace') });
+    caret = p;
+    const added = n.slice(p, n.length - s).join('');
+    if (added) { out.push({ text: added }); caret = n.length - s; }
+  }
+  move(Math.min(nc, n.length));
+  return out;
+}
+// --- end planEdits ---
+
+// What Claude's bar holds (as far as we know), and the goals still to reach, in order.
+// Goals are states {t, c} or 'enter'; fast typing replaces the last waiting state, so it goes out as one edit.
+const BAR = { synced: { t: '', c: 0 }, q: [], busy: false, adoptAt: 0 };
+
+function want(t, c) {
+  const last = BAR.q[BAR.q.length - 1];
+  if (last && last !== 'enter') BAR.q[BAR.q.length - 1] = { t, c };
+  else BAR.q.push({ t, c });
+  pump();
+}
+
+async function pump() {
+  if (BAR.busy || !S.pane) return;
+  BAR.busy = true;
+  try {
+    while (BAR.q.length) {
+      const g = BAR.q.shift();
+      if (g === 'enter') {
+        await post('keys', { keys: ['enter'] });
+        BAR.synced = { t: '', c: 0 };
+        continue;
+      }
+      for (const e of planEdits(BAR.synced.t, BAR.synced.c, g.t, g.c)) await post(e.keys ? 'keys' : 'text', e);
+      BAR.synced = g;
+    }
+  } catch (e) {
+    BAR.q.length = 0;
+    toast('Not typed: ' + e.message);
+    BAR.adoptAt = Date.now();   // take Claude's bar as it really is
+  } finally {
+    BAR.busy = false;
+  }
+}
+
+const cp = (s) => [...s].length;   // code points, like planEdits
+function mirror() {
+  let v = E.box.value;
+  if (/[\r\n]/.test(v)) {   // a newline would press Enter in Claude: pasted lines become one line
+    const at = E.box.selectionStart;
+    v = v.replace(/\r\n?|\n/g, ' ');
+    E.box.value = v;
+    E.box.setSelectionRange(at, at);
+  }
+  grow();
+  want(v, cp(v.slice(0, E.box.selectionEnd)));
+}
+
+// Claude's bar changed by itself (history, tab completion, ^C, a failed edit): the box takes its text.
+function adopt() {
+  if (BAR.busy || BAR.q.length) return;
+  const t = S.barText || '';
+  E.box.value = t;
+  BAR.synced = { t, c: cp(t) };
+  grow();
+}
+
+function send() {
+  if (!S.pane) return;
+  const text = E.box.value.trim() || (S.barText || '').trim();
+  mirror();
+  BAR.q.push('enter');
+  pump();
+  E.box.value = '';
+  grow();
+  if (text) showSending(text);
+}
+
+function grow() {
+  E.box.style.height = 'auto';
+  E.box.style.height = Math.min(E.box.scrollHeight, 100) + 'px';   // wraps like Claude's bar, then scrolls
+}
+
+E.box.addEventListener('input', mirror);
+document.addEventListener('selectionchange', () => { if (document.activeElement === E.box) mirror(); });
+E.box.addEventListener('keydown', (e) => {
+  // Claude's bar is one line: Enter sends on phone and desktop alike
+  if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); send(); }
+});
+E.box.addEventListener('focus', () => { E.inputRow.classList.add('typing'); adopt(); });
+E.box.addEventListener('blur', () => E.inputRow.classList.remove('typing'));
+E.send.addEventListener('click', send);
+E.send.addEventListener('mousedown', (e) => e.preventDefault());   // keep the keyboard up after Send
+
+/* ---------- keys ---------- */
 
 const KEYS = [['esc', 'esc'], ['^C', 'ctrl+c'], ['tab', 'tab'], ['⇧tab', 'shift+tab'], ['↑', 'up'], ['↓', 'down'], ['⏎', 'enter']];
 const MENU_KEYS = [['↑', 'up'], ['↓', 'down'], ['select', 'enter', 'primary'], ['esc', 'esc']];
 
+function pressKey(key, blocked) {
+  if (!S.pane) return;
+  if (key === 'enter' && !blocked) return send();
+  sendKeys([key]);
+  BAR.adoptAt = Date.now() + 150;   // the key may change Claude's bar (history, completion, clear)
+}
+
 function renderBottom() {
   const a = agent();
   const blocked = !!a && a.status === 'blocked';
-  const menu = blocked ? ((S.live && S.live.menu) || a.menu || []) : [];
-  const mSig = JSON.stringify(menu);
-  if (mSig !== S.menuSig) {
-    S.menuSig = mSig;
-    E.menu.hidden = !menu.length;
-    E.menu.replaceChildren(...menu.map((o) => {
-      const b = h('button', 'opt');
-      b.type = 'button';
-      const text = h('span', 'opt-text');
-      text.append(h('span', null, o.label));
-      if (o.detail) text.append(h('span', 'detail', o.detail));   // Claude's description under the option
-      b.append(h('b', null, String(o.n)), text);
-      b.onclick = () => sendKeys([String(o.n)]);
-      return b;
-    }));
-  }
   const kSig = String(blocked) + !!S.pane;
   if (kSig !== S.keySig) {
     S.keySig = kSig;
@@ -339,15 +498,15 @@ function renderBottom() {
       b.type = 'button';
       b.disabled = !S.pane;
       b.setAttribute('aria-label', key);
-      b.onclick = () => sendKeys([key]);
+      b.onclick = () => pressKey(key, blocked);
       return b;
     }));
   }
   E.send.disabled = !S.pane;
 }
 
-// Tapping a key must not take focus (and the phone keyboard) away from the message box.
-for (const el of [E.keys, E.menu]) el.addEventListener('mousedown', (e) => e.preventDefault());
+// Tapping a key must not take focus (and the phone keyboard) away from the box.
+for (const el of [E.keys, E.barAbove]) el.addEventListener('mousedown', (e) => e.preventDefault());
 
 /* ---------- top bar and drawer ---------- */
 
@@ -401,9 +560,11 @@ function pick(pane) {
   S.pane = pane;
   save('herdr.pane', pane);
   S.items = []; S.nodes = []; S.live = null; S.fresh = true;
-  S.liveSig = S.menuSig = S.keySig = '';
+  S.liveSig = S.barSig = S.keySig = '';
+  BAR.q.length = 0; BAR.synced = { t: '', c: 0 };
+  E.box.value = '';
   while (E.pending.firstChild) dropPending();
-  renderAll(); renderTop(); renderDrawer(); renderLive(); renderBottom();
+  renderAll(); renderTop(); renderDrawer(); renderLive(); renderBar(); renderBottom();
   connect();
 }
 
@@ -436,7 +597,12 @@ function connect() {
   });
   on('history_full', (d) => { if (mine(d)) { S.items = d.items || []; renderAll(); } });
   on('history', (d) => { if (mine(d)) applyItem(d); });
-  on('live', (d) => { if (mine(d)) { S.live = d; renderLive(); renderBottom(); } });
+  on('live', (d) => {
+    if (!mine(d)) return;
+    S.live = d;
+    renderLive(); renderBar(); renderBottom();
+    if (BAR.adoptAt && Date.now() >= BAR.adoptAt) { BAR.adoptAt = 0; adopt(); }
+  });
 }
 
 // iOS drops the stream while the page is in the background: reconnect at once when it comes back.
@@ -446,22 +612,6 @@ document.addEventListener('visibilitychange', () => {
     connect();
   }
 });
-
-/* ---------- message box ---------- */
-
-function grow() {
-  E.box.style.height = 'auto';
-  E.box.style.height = Math.min(E.box.scrollHeight, 154) + 'px';   // 6 lines of 22 px + padding, then it scrolls
-}
-E.box.addEventListener('input', grow);
-// Phones (Messages, WhatsApp): Enter is a new line and only Send sends. Desktop: Enter sends, Shift+Enter is a new line.
-const TOUCH = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
-E.box.enterKeyHint = TOUCH ? 'enter' : 'send';
-E.box.addEventListener('keydown', (e) => {
-  if (!TOUCH && e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
-});
-E.composer.addEventListener('submit', (e) => { e.preventDefault(); send(); });
-E.send.addEventListener('mousedown', (e) => e.preventDefault());   // keep the keyboard up after Send
 
 // The phone keyboard shrinks the visible area, not 100dvh: size the app to what is visible.
 const vv = window.visualViewport;
@@ -477,6 +627,6 @@ if (vv) {
 
 /* ---------- start ---------- */
 
-renderAll(); renderTop(); renderBottom();
+renderAll(); renderTop(); renderBar(); renderBottom();
 if (!S.pane && innerWidth < 900) drawer(true);
 connect();
