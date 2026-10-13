@@ -65,7 +65,7 @@ def call(method, params=None, timeout=5):
 
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
-MENU_LINE = re.compile(r"^(?:[❯›>]\s*)?(\d{1,2})[.)]\s+(.+?)$")
+MENU_LINE = re.compile(r"^(?:[❯›>↓↑]\s*)?(\d{1,2})[.)]\s+(.+?)$")   # ↓ ↑: a scrolled list's edge row
 
 
 def tilde(path):
@@ -293,7 +293,7 @@ def parse_menu(text):
         line = x.strip()
         m = MENU_LINE.match(line)
         if not m:
-            if last and line and x[:1].isspace() and not RULE.match(line):
+            if last and line and x[:1].isspace() and not RULE.match(line) and not line.startswith("…"):
                 last["detail"] = (last.get("detail", "") + " " + line).strip()
             else:
                 last = None
@@ -303,7 +303,7 @@ def parse_menu(text):
             found = []
         last = None
         if n == len(found) + 1:
-            last = {"n": n, "label": m.group(2).strip()}
+            last = {"n": n, "label": re.sub(r" {3,}", "  ", m.group(2).strip())}   # columns padded for the Mac width
             found.append(last)
     return found if len(found) >= 2 else None
 
@@ -367,9 +367,20 @@ def live_view(text, items, status):
     menu, question, inp, foot = None, [], "", n
     pick = next((i for i in range(n - 1, -1, -1) if MENU_PICK.match(plain[i].strip("│").strip())), None)
     if pick is not None and not any(p.startswith("❯") and not MENU_PICK.match(p) for p in plain[pick + 1:]):
-        first = next((i for i in range(pick, -1, -1) if re.match(r"^(?:❯\s*)?1\.\s", plain[i].strip("│").strip())), pick)
+        first = next((i for i in range(pick, -1, -1) if re.match(r"^(?:[❯↓↑]\s*)?1\.\s", plain[i].strip("│").strip())), pick)
         rule = next((i for i in range(first - 1, max(first - 13, -1), -1) if RULE.match(plain[i])), None)
         foot = first if rule is None else rule
+        if rule is None:   # no rule (the /model dialog): take the title block above, one blank line allowed
+            blanks = 0
+            for i in range(first - 1, max(first - 13, -1), -1):
+                if re.match(r"^[▔─━]{9,}$", plain[i]):
+                    break
+                if not plain[i]:
+                    blanks += 1
+                    if blanks > 1:
+                        break
+                    continue
+                foot = i
         menu = parse_menu("\n".join(raw[foot:]))
         # the question above the options; the options themselves become buttons from `menu`
         question = [raw[i] for i in range(foot, first) if plain[i] and not RULE.match(plain[i])]

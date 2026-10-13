@@ -318,6 +318,11 @@ function renderLive() {
 /* ---------- Claude's bar: suggestions, status block, the ❯ line, mode lines, or a menu ---------- */
 
 // a slash-command suggestion row; the selected one starts with "❯ ", some carry an alias: "/usage (stats)"
+// an option line of a menu Claude draws: "❯ 1. Yes", "  2. No", or with a scroll marker "↓ 5. More"
+const MENU_OPT = /^(?:❯\s*)?[↑↓]?\s*\d{1,2}[.)]\s/;
+// A menu is up: herdr says blocked, or Claude draws one of its own dialogs (/model, /config) while "idle".
+const menuUp = () => (agent() || {}).status === 'blocked' || !!(S.live && S.live.menu);
+
 const SUGGEST = /^(?:❯\s*)?\/[A-Za-z0-9:._-]+(?:\s+\([^)]*\))?(\s{2,}|$)/;
 
 function renderBar() {
@@ -328,7 +333,7 @@ function renderBar() {
   S.barSig = sig;
   const plain = footer.map((l) => l.replace(ESC_RE, ''));
   // Claude's own ❯ line (a menu's "❯ 1. Yes" is an option, not the bar)
-  const prompt = L && L.menu ? -1 : plain.map((p) => p.trim().startsWith('❯')).lastIndexOf(true);
+  const prompt = L && L.menu ? -1 : plain.map((p) => p.trim().startsWith('❯') && !MENU_OPT.test(p.trim())).lastIndexOf(true);
   const html = (from, to) => {
     let out = '', cmd = '';
     for (let i = from; i < to; i++) {
@@ -348,6 +353,7 @@ function renderBar() {
   S.barText = prompt < 0 ? '' : barText(footer[prompt]);
   E.inputRow.classList.toggle('nodrawn', prompt < 0);
   E.inputRow.hidden = !!(L && L.menu);   // a menu takes keys, not text
+  if (E.inputRow.hidden && document.activeElement === E.box) E.box.blur();
 }
 
 // Tap a suggestion: the bar gets that command and a space, as if typed.
@@ -480,16 +486,15 @@ E.send.addEventListener('mousedown', (e) => e.preventDefault());   // keep the k
 const KEYS = [['esc', 'esc'], ['^C', 'ctrl+c'], ['tab', 'tab'], ['⇧tab', 'shift+tab'], ['↑', 'up'], ['↓', 'down'], ['⏎', 'enter']];
 const MENU_KEYS = [['↑', 'up'], ['↓', 'down'], ['select', 'enter', 'primary'], ['esc', 'esc']];
 
-function pressKey(key, blocked) {
+function pressKey(key) {
   if (!S.pane) return;
-  if (key === 'enter' && !blocked) return send();
+  if (key === 'enter' && !menuUp()) return send();
   sendKeys([key]);
   BAR.adoptAt = Date.now() + 150;   // the key may change Claude's bar (history, completion, clear)
 }
 
 function renderBottom() {
-  const a = agent();
-  const blocked = !!a && a.status === 'blocked';
+  const blocked = menuUp();
   const kSig = String(blocked) + !!S.pane;
   if (kSig !== S.keySig) {
     S.keySig = kSig;
@@ -498,7 +503,7 @@ function renderBottom() {
       b.type = 'button';
       b.disabled = !S.pane;
       b.setAttribute('aria-label', key);
-      b.onclick = () => pressKey(key, blocked);
+      b.onclick = () => pressKey(key);
       return b;
     }));
   }
@@ -624,6 +629,9 @@ if (vv) {
   vv.addEventListener('resize', fit);
   fit();
 }
+
+// The colour guard in span() depends on the theme: redraw Claude's lines when it changes.
+darkMQ.addEventListener('change', () => { S.liveSig = S.barSig = ''; renderLive(); renderBar(); });
 
 /* ---------- start ---------- */
 
