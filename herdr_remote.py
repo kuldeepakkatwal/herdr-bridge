@@ -360,11 +360,11 @@ def live_view(text, items, status):
     footer: Claude's input-bar region as drawn (suggestions, status block, bar, mode lines), or the whole
     menu; clients that draw their own bar or buttons ignore it.
     -> {"lines": [raw ANSI lines], "working": str|None, "menu": [{n, label[, detail]}]|None, "input": str,
-        "footer": [raw ANSI lines]}"""
+        "footer": [raw ANSI lines], "suggestions": [{command, detail?, selected}]}"""
     raw = [l.rstrip("\r") for l in text.split("\n")]
     plain = [ANSI.sub("", l).strip() for l in raw]
     n = len(raw)
-    menu, question, inp, foot = None, [], "", n
+    menu, question, inp, foot, suggestions = None, [], "", n, []
     pick = next((i for i in range(n - 1, -1, -1) if MENU_PICK.match(plain[i].strip("│").strip())), None)
     if pick is not None and not any(p.startswith("❯") and not MENU_PICK.match(p) for p in plain[pick + 1:]):
         first = next((i for i in range(pick, -1, -1) if re.match(r"^(?:[❯↓↑]\s*)?1\.\s", plain[i].strip("│").strip())), pick)
@@ -396,11 +396,21 @@ def live_view(text, items, status):
                 else:
                     gap += 1
                 i -= 1
-            i = foot - 1   # the slash-command list Claude draws above it, with its wrapped descriptions
+            end, i = foot, foot - 1   # the slash-command list Claude draws above it, with its wrapped descriptions
             while i >= 0 and (SUGGESTION.match(plain[i]) or (plain[i] and re.match(r"^ {8,}\S", ANSI.sub("", raw[i])))):
                 if SUGGESTION.match(plain[i]):
                     foot = i
                 i -= 1
+            for i in range(foot, end):   # one alias in parentheses belongs to the command: "/usage (stats)"
+                m = re.match(r"^(❯\s*)?(/[A-Za-z0-9:._-]+(?: \([^)]*\))?)(.*)$", plain[i])
+                if m and SUGGESTION.match(plain[i]):
+                    suggestions.append({"command": m.group(2), "detail": m.group(3), "selected": bool(m.group(1))})
+                elif suggestions:
+                    suggestions[-1]["detail"] += " " + plain[i]
+            for sg in suggestions:
+                d = " ".join(sg.pop("detail").split())
+                if d:
+                    sg["detail"] = d
     body = list(range(foot))
     working = None
     for i in reversed(body):
@@ -425,7 +435,7 @@ def live_view(text, items, status):
     while footer and not ANSI.sub("", footer[-1]).strip():
         footer.pop()
     return {"lines": [raw[i] for i in block] + question, "working": working, "menu": menu, "input": inp,
-            "footer": footer}
+            "footer": footer, "suggestions": suggestions}
 
 
 def read_screen(pane, source="recent_unwrapped", fmt="ansi", lines=400):

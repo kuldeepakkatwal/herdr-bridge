@@ -19,7 +19,7 @@
  *   state         {herdr, workspaces:[{id,label,path,agents:[{pane_id,title,status,menu,...}]}]}
  *   history_full  {pane_id, items, title}            replaces the list
  *   history       {pane_id, item, index, replace_last} append when index == length, else replace at index
- *   live          {pane_id, lines, working, menu, input, footer}  what Claude is drawing right now; footer = its
+ *   live          {pane_id, lines, working, menu, input, footer, suggestions}  what Claude is drawing right now; footer = its
  *                 input-bar region (suggestions, status block, ❯ line, mode lines) or the whole menu
  */
 'use strict';
@@ -328,7 +328,8 @@ const SUGGEST = /^(?:❯\s*)?\/[A-Za-z0-9:._-]+(?:\s+\([^)]*\))?(\s{2,}|$)/;
 function renderBar() {
   const L = S.live;
   const footer = (L && L.footer) || [];
-  const sig = JSON.stringify(footer);
+  const list = L && L.suggestions && L.suggestions.length ? L.suggestions : null;   // parsed by the bridge
+  const sig = JSON.stringify([footer, list]);
   if (sig === S.barSig) return;
   S.barSig = sig;
   const plain = footer.map((l) => l.replace(ESC_RE, ''));
@@ -341,19 +342,30 @@ function renderBar() {
       if (SUGGEST.test(p)) cmd = p.replace(/^❯\s*/, '').split(/\s/)[0];
       else if (!/^ {8,}\S/.test(plain[i])) cmd = '';   // a suggestion's wrapped description keeps its command
       const c = BOX_ONLY.test(plain[i]) || !cmd ? 'clip' : 'sugg';
+      if (c === 'sugg' && list) continue;   // drawn as the table below instead
       // a suggestion's column padding is drawn for the Mac width: at phone width keep two spaces of it
       const line = c === 'sugg' ? footer[i].replace(/^ {8,}/, '      ').replace(/(\S) {3,}/g, '$1  ') : footer[i];
       out += `<div class="${c}"${cmd ? ` data-cmd="${escHtml(cmd)}"` : ''}>${ansiHtml(line) || ' '}</div>`;
     }
     return out;
   };
-  E.barAbove.innerHTML = html(0, prompt < 0 ? footer.length : prompt);
+  E.barAbove.innerHTML = (list ? suggestTable(list) : '') + html(0, prompt < 0 ? footer.length : prompt);
   E.barBelow.innerHTML = prompt < 0 ? '' : html(prompt + 1, footer.length);
   E.drawn.innerHTML = prompt < 0 ? '' : ansiHtml(footer[prompt]);
   S.barText = prompt < 0 ? '' : barText(footer[prompt]);
   E.inputRow.classList.toggle('nodrawn', prompt < 0);
   E.inputRow.hidden = !!(L && L.menu);   // a menu takes keys, not text
   if (E.inputRow.hidden && document.activeElement === E.box) E.box.blur();
+}
+
+// Claude Code's narrow layout of the slash-command list: command | detail, the detail wrapping in its column.
+function suggestTable(list) {
+  return '<table class="suggest">' + list.map((r) => {
+    const cmd = escHtml(r.command || '');   // may carry an alias: "/usage (stats)"; a tap types only "/usage"
+    return `<tr data-cmd="${escHtml((r.command || '').split(' ')[0])}"${r.selected ? ' class="on"' : ''}>` +
+      `<td class="c">${r.selected ? '❯ ' : '  '}${cmd}</td>` +
+      `<td class="d">${escHtml(r.detail || '')}</td></tr>`;
+  }).join('') + '</table>';
 }
 
 // Tap a suggestion: the bar gets that command and a space, as if typed.

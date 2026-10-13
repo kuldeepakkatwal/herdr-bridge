@@ -103,6 +103,14 @@ button { font: inherit; color: inherit; border: 0; background: none; cursor: poi
 #bar { font: 12px/1.45 var(--mono); margin-bottom: 8px; max-height: 50vh; overflow-y: auto; overflow-x: hidden; }
 #bar .sugg { white-space: pre-wrap; overflow-wrap: anywhere; cursor: pointer; border-radius: 4px; }
 #bar .sugg:hover { background: var(--soft); }
+#bar .suggest { border-collapse: collapse; width: 100%; margin-bottom: 4px; }
+#bar .suggest tr { cursor: pointer; }
+#bar .suggest tr:hover { background: var(--soft); }
+#bar .suggest td { padding: 1px 0; vertical-align: top; }
+#bar .suggest .c { white-space: pre; padding-right: 2ch; color: var(--mut); }
+#bar .suggest .d { width: 100%; color: var(--mut); overflow-wrap: anywhere; }
+#bar .suggest .on .c, #bar .suggest .on .d { color: var(--accent); }
+#bar .suggest .on .c { font-weight: 700; }
 #inputRow { display: flex; align-items: center; gap: 8px; min-height: 44px; }
 #lineWrap { flex: 1; min-width: 0; position: relative; }
 #drawn { white-space: pre-wrap; overflow-wrap: anywhere; cursor: text; }
