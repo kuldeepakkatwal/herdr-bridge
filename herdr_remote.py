@@ -6,6 +6,7 @@ Tailscale-User-Login header this bridge checks.
 """
 import argparse
 import base64
+import datetime
 import errno
 import fcntl
 import glob
@@ -33,6 +34,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 HOME = os.path.expanduser("~")
 SOCK = os.path.join(HOME, ".config/herdr/herdr.sock")
 UPLOADS = os.path.join(HOME, ".herdr-remote", "uploads")   # pictures sent from the phone
+SCREEN_SOCK = os.path.join(HOME, ".herdr-remote", "screen.sock")   # Herdr Screen helper (Mac only)
 
 
 class HerdrError(Exception):
@@ -41,12 +43,12 @@ class HerdrError(Exception):
         self.code = code
 
 
-def call(method, params=None, timeout=5):
+def call(method, params=None, timeout=5, sock=None):
     """One request per connection: herdr speaks newline-delimited JSON."""
     s = socket.socket(socket.AF_UNIX)
     s.settimeout(timeout)
     try:
-        s.connect(SOCK)
+        s.connect(sock or SOCK)
         s.sendall((json.dumps({"id": "b", "method": method, "params": params or {}}) + "\n").encode())
         buf = b""
         while b"\n" not in buf:
@@ -64,6 +66,16 @@ def call(method, params=None, timeout=5):
     return msg["result"]
 
 
+def screen(method, params=None):
+    """Ask the Herdr Screen helper (mac-screen/). Missing helper -> {"status": "not_installed"}."""
+    if not os.path.exists(SCREEN_SOCK):
+        return {"status": "not_installed"}
+    try:
+        return call(method, params, timeout=5, sock=SCREEN_SOCK)
+    except (ConnectionRefusedError, FileNotFoundError):
+        return {"status": "not_running"}
+
+
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
 MENU_LINE = re.compile(r"^(?:[❯›>↓↑]\s*)?(\d{1,2})[.)]\s+(.+?)$")   # ↓ ↑: a scrolled list's edge row
 
@@ -73,14 +85,29 @@ def tilde(path):
 
 
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
-_transcripts = {}   # path -> ((mtime, size), items, title)
+_tails = {}   # (projects dir, session id) -> Tail
+_tails_lock = threading.Lock()
 
 
 def session_file(session_id):
     if not session_id or "/" in session_id:
         return None
     hits = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", session_id + ".jsonl"))
-    return hits[0] if hits else None
+    if not hits:
+        return None
+    # Claude Code can move a conversation to a new session file (it copies it over) and ends the old
+    # file with a continued-in record. herdr keeps reporting the old id, so follow the record.
+    with open(hits[0], "rb") as f:
+        f.seek(max(0, os.path.getsize(hits[0]) - 1024))
+        last = f.read().rstrip(b"\n").rsplit(b"\n", 1)[-1]
+    if b'"continued-in"' in last:
+        try:
+            nxt = json.loads(last).get("continuedInSessionId")
+        except ValueError:
+            nxt = None
+        if nxt and nxt != session_id:
+            return session_file(nxt) or hits[0]
+    return hits[0]
 
 
 def _tool_line(block):
@@ -116,12 +143,14 @@ class Tail:
     lines; skips thinking, tool results, meta/sidechain records and local command output.
     """
 
-    def __init__(self, path=None, session=None):
+    def __init__(self, path=None, session=None, sidechain=False):
         self.path, self.session = path, session
+        self.sidechain = sidechain   # True: a helper agent's own transcript, where every record is a sidechain one
         self.offset, self.rest = 0, b""
-        self.items, self.title = [], None
+        self.items, self.title, self.custom = [], None, None
         self.expect = []   # texts of dequeued messages: Claude Code writes each once more as a user record
         self.queue = []    # Claude Code's queue as (text, item index or None for a hidden notification), oldest first
+        self.moved = None  # session id from a continued-in record
 
     def _event(self, i):
         return {"item": dict(self.items[i]), "index": i, "replace_last": i == len(self.items) - 1}
@@ -171,12 +200,19 @@ class Tail:
         except ValueError:
             return []
         t = d.get("type")
+        if t == "custom-title":   # /rename: the user's name sticks, Claude's later automatic titles don't replace it
+            self.custom = d.get("customTitle") or self.custom
+            self.title = self.custom or self.title
+            return []
         if t == "ai-title":
-            self.title = d.get("aiTitle") or self.title
+            self.title = self.custom or d.get("aiTitle") or self.title
             return []
         if t == "queue-operation":
             return self._queue(d)
-        if t not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain"):
+        if t == "continued-in":
+            self.moved = d.get("continuedInSessionId")
+            return []
+        if t not in ("user", "assistant") or d.get("isMeta") or (d.get("isSidechain") and not self.sidechain):
             return []
         content = (d.get("message") or {}).get("content")
         ts = d.get("timestamp")
@@ -209,9 +245,12 @@ class Tail:
             self.path = session_file(self.session)   # a new session's file appears a moment after it starts
         if not self.path or not os.path.exists(self.path):
             return []
-        if os.stat(self.path).st_size < self.offset:
-            self.__init__(self.path, self.session)
+        size = os.stat(self.path).st_size
+        if size < self.offset:
+            self.__init__(self.path, self.session, self.sidechain)
             return None
+        if size == self.offset:   # nothing new: skip the open
+            return []
         with open(self.path, "rb") as f:
             f.seek(self.offset)
             chunk = f.read()
@@ -223,6 +262,10 @@ class Tail:
         out = []
         for raw in lines:
             out.extend(self._record(raw.decode("utf-8", "replace")))
+        if self.moved:   # the conversation went on in a new file that repeats it: read that one whole
+            self.__init__(session=self.moved)
+            self.read()
+            return None
         return out
 
 
@@ -234,17 +277,39 @@ def parse_transcript(path):
 
 
 def transcript(session_id):
-    """Cached by file mtime+size, so polling titles every second costs one stat()."""
-    path = session_file(session_id)
-    if not path:
-        return [], None
-    st = os.stat(path)
-    key = (st.st_mtime, st.st_size)
-    hit = _transcripts.get(path)
-    if not hit or hit[0] != key:
-        hit = (key,) + parse_transcript(path)
-        _transcripts[path] = hit
-    return hit[1], hit[2]
+    """Claude's saved session -> (items, title). One Tail per session, so each call reads only what
+    was appended since the last: a working agent's growing file is not re-parsed every refresh."""
+    with _tails_lock:   # the refresh loop and HTTP threads share these Tails
+        t = _tail(session_id)
+        return (list(t.items), t.title) if t else ([], None)   # a copy: the refresh loop keeps appending to t.items
+
+
+def session_title(session_id):
+    """Only the title: the refresh asks for it per agent every second, so no copy of the items."""
+    with _tails_lock:
+        t = _tail(session_id)
+        return t.title if t else None
+
+
+def _tail(session_id):
+    """The session's Tail, read up to now. Caller holds _tails_lock."""
+    key = (CLAUDE_PROJECTS, session_id)
+    t = _tails.get(key)
+    if not t:
+        path = session_file(session_id)
+        if not path:
+            return None
+        t = _tails[key] = Tail(path)
+    if t.read() is None:   # the file shrank or was replaced: Tail restarted, read it from the top
+        t.read()
+    return t
+
+
+def prune_tails(keep):
+    """Forget Tails of sessions not in `keep` (closed tabs, /clear), so _tails doesn't grow forever."""
+    with _tails_lock:
+        for k in [k for k in _tails if k[1] not in keep]:
+            del _tails[k]
 
 
 def build_state(workspaces, tabs, agents):
@@ -253,6 +318,7 @@ def build_state(workspaces, tabs, agents):
     out = []
     for w in workspaces:
         ags = [a for a in agents if a.get("workspace_id") == w["workspace_id"]]
+        titles = {a["pane_id"]: _session_title(a) for a in ags}   # once per agent: each takes the global lock
         out.append({
             "id": w["workspace_id"],
             "label": w.get("label") or str(w.get("number", "")),
@@ -261,11 +327,13 @@ def build_state(workspaces, tabs, agents):
                 "pane_id": a["pane_id"],
                 "tab_id": a.get("tab_id"),
                 "tab_label": tab_label.get(a.get("tab_id")),
-                "title": tab_label.get(a.get("tab_id")) or a.get("terminal_title_stripped") or _session_title(a) or a.get("agent") or a["pane_id"],
+                "title": tab_label.get(a.get("tab_id")) or a.get("terminal_title_stripped") or titles[a["pane_id"]] or a.get("agent") or a["pane_id"],
+                "session_title": titles[a["pane_id"]] if a.get("agent") == "claude" else None,   # Claude's conversation title
                 "agent": a.get("agent"),
                 "status": a.get("agent_status", "unknown"),
                 "session": (a.get("agent_session") or {}).get("value"),   # Claude Code session id: its transcript file
                 "cwd": tilde(a.get("cwd")),
+                "last_active": _last_active(a) if a.get("agent_status") != "working" else None,   # a working agent's file changes every second
                 "menu": None,
             } for a in ags],
         })
@@ -273,10 +341,78 @@ def build_state(workspaces, tabs, agents):
 
 
 def _session_title(agent):
+    sid = (agent.get("agent_session") or {}).get("value")
     try:
-        return transcript((agent.get("agent_session") or {}).get("value"))[1]
+        return session_title(sid) if sid else None
     except OSError:
         return None
+
+
+HELPER_ID = re.compile(r"^a[0-9a-f]{6,40}$")
+HELPER_META = re.compile(r"^agent-(a[0-9a-f]{6,40})\.meta\.json$")
+
+
+def _epoch(ts):
+    """Claude Code's ISO timestamp ("2026-10-15T20:27:29.886Z") -> epoch seconds, None if unreadable."""
+    try:
+        return int(datetime.datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc).timestamp()) if ts else None
+    except (TypeError, ValueError):
+        return None
+
+
+def helpers_dir(session_id):
+    """Where Claude Code keeps a chat's helper agents: <proj>/<session>/subagents next to <session>.jsonl."""
+    path = session_file(session_id)
+    return os.path.join(path[:-len(".jsonl")], "subagents") if path else None
+
+
+def helpers(session_id, now=None):
+    """The chat's helper agents (subagents), working first, then the most recently active. Max 50."""
+    d = helpers_dir(session_id)
+    try:
+        names = os.listdir(d) if d else []
+    except OSError:
+        return []
+    now = time.time() if now is None else now
+    found = []
+    for n in names:
+        m = HELPER_META.match(n)
+        try:
+            st = m and os.stat(os.path.join(d, "agent-%s.jsonl" % m.group(1)))
+        except OSError:
+            continue
+        if st:
+            found.append((st.st_mtime, m.group(1), st))
+    out = []
+    for mtime, hid, st in sorted(found, reverse=True)[:50]:
+        base = os.path.join(d, "agent-" + hid)
+        try:
+            with open(base + ".meta.json") as f:
+                meta = json.load(f)
+            with open(base + ".jsonl", "rb") as f:
+                first = f.readline()
+            ts = json.loads(first).get("timestamp") if first.strip() else None
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        out.append({"id": hid, "description": meta.get("description"), "model": meta.get("model"),
+                    "agent_type": meta.get("agentType"), "started": _epoch(ts) or int(st.st_ctime),
+                    "last_active": int(mtime),
+                    # ponytail: mtime within 30 s = working; a finished helper can read "working" up to 30 s.
+                    "working": now - mtime < 30})
+    out.sort(key=lambda h: (not h["working"], -h["last_active"]))
+    return out
+
+
+def _last_active(agent):
+    """When the last real message (yours or Claude's) was written, epoch seconds. Not the file's mtime: Claude
+    Code appends housekeeping records (mode, permission-mode, ...) to idle chats, which looked like activity."""
+    sid = (agent.get("agent_session") or {}).get("value")
+    with _tails_lock:
+        t = _tails.get((CLAUDE_PROJECTS, sid))
+        ts = next((i.get("ts") for i in reversed(t.items) if i.get("ts")), None) if t else None
+    return _epoch(ts)
 
 
 def parse_menu(text):
@@ -654,6 +790,10 @@ class Hub:
                             a["menu"] = parse_menu(read_screen(a["pane_id"], source="visible", fmt="text"))
                         except HerdrError:
                             pass
+            # Keep Tails of sessions still open, and of any a phone watches (from the old state, before publish).
+            with self.lock:
+                watched = {q.watch for q in self.clients if getattr(q, "watch", None)}
+            prune_tails({a["session"] for w in ws for a in w["agents"]} | {session_of(self, p) for p in watched})
             self.publish({"herdr": "online", "workspaces": ws})
         except (OSError, HerdrError, ValueError, KeyError):
             self.publish({"herdr": "offline", "workspaces": self.snapshot()["workspaces"]})
@@ -706,13 +846,30 @@ IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG")   # JPEG, PNG
 MAX_IMAGE = 10 << 20
 
 
+def save_upload(data):
+    """A picture uploaded on attach, so the send itself only carries its path."""
+    if not data.startswith(IMAGE_MAGIC) or len(data) > MAX_IMAGE:
+        raise ValueError("not a JPEG/PNG under 10 MB")
+    os.makedirs(UPLOADS, exist_ok=True)
+    path = os.path.join(UPLOADS, "%d-%s.%s" % (time.time() * 1000, os.urandom(2).hex(), "png" if data.startswith(b"\x89") else "jpg"))
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
 def _send(pane, b):
     """Pictures from the phone are saved as files and their paths typed into the agent with the text,
     then Enter: Claude Code opens image files from a typed path. Rejected: the Mac clipboard paste
     (an osascript plus a 0.5 s wait per picture, and it replaced the owner's clipboard)."""
-    images = b.get("images") or []
-    if not isinstance(images, list) or len(images) > 5:
-        raise ValueError("images must be a list of at most 5")
+    images, given = b.get("images") or [], b.get("paths") or []
+    if not isinstance(images, list) or not isinstance(given, list) or len(images) + len(given) > 5:
+        raise ValueError("images and paths must be lists, at most 5 together")
+    # paths come from /api/uploads; only files directly in UPLOADS may be typed (no ../, no symlink out)
+    if not all(isinstance(p, str) for p in given):
+        raise ValueError("paths must be strings")
+    given = [os.path.realpath(p) for p in given]
+    if any(not os.path.isfile(p) or os.path.dirname(p) != os.path.realpath(UPLOADS) for p in given):
+        raise ValueError("paths must be files sent to /api/uploads")
     blobs = [base64.b64decode(enc, validate=True) for enc in images]
     for i, data in enumerate(blobs):
         if not data.startswith(IMAGE_MAGIC) or len(data) > MAX_IMAGE:
@@ -724,7 +881,7 @@ def _send(pane, b):
         with open(path, "wb") as f:
             f.write(data)
         paths.append(path)
-    text = " ".join(paths + [str(b.get("text") or "").strip()]).strip()
+    text = " ".join(paths + given + [str(b.get("text") or "").strip()]).strip()
     if not text:
         raise ValueError("nothing to send")
     call("pane.send_text", {"pane_id": pane, "text": text})
@@ -817,12 +974,21 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
             pass
 
         def _json(self, code, obj):
+            # bridge.log: agent actions, uploads and every error; never the text, the bytes or headers
+            note, self._note = getattr(self, "_note", None), None   # one line per reply, not per connection
+            if code >= 400 or note is not None:
+                sys.stderr.write("%s  %s %s  %d%s\n" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                 self.command, urlparse(self.path).path, code, "  " + note if note else ""))
+                sys.stderr.flush()
             data = json.dumps(obj).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):   # the phone hung up; nothing to tell it
+                self.close_connection = True
 
         def _err(self, code, ecode, message):
             self._json(code, {"error": {"code": ecode, "message": message}})
@@ -876,6 +1042,15 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                     return self._err(409, e.code, str(e))
                 limit = int(parse_qs(u.query).get("limit", ["500"])[0])
                 return self._json(200, {"items": items[-limit:], "total": len(items), "title": title})
+            if len(parts) == 6 and parts[:2] == ["api", "agents"] and parts[3] == "helpers" and parts[5] == "events":
+                pane, hid = unquote(parts[2]), unquote(parts[4])
+                if not HELPER_ID.match(hid):
+                    return self._err(400, "bad_id", "not a helper id")
+                d = helpers_dir(session_of(hub, pane))   # only that pane's own session folder; no path from the phone
+                path = os.path.join(d, "agent-%s.jsonl" % hid) if d else None
+                if not path or not os.path.isfile(path):
+                    return self._err(404, "not_found", "no such helper")
+                return self._helper_stream(pane, hid, path)
             if len(parts) == 4 and parts[:2] == ["api", "term"] and parts[3] == "stream":
                 return self._term_stream(parts[2])
             if u.path == "/api/clipboard":
@@ -890,6 +1065,13 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                 return
             parts = urlparse(self.path).path.strip("/").split("/")
             try:
+                if parts == ["api", "uploads"]:   # raw picture bytes, not JSON
+                    n = int(self.headers.get("Content-Length") or 0)
+                    self._note = "bytes=%d" % n
+                    if n > MAX_IMAGE:
+                        self.close_connection = True  # the body was not read
+                        raise ValueError("over 10 MB")
+                    return self._json(200, {"path": save_upload(self.rfile.read(n))})
                 body = self._body()
                 if parts == ["api", "clipboard"]:
                     clip_set(str(body["text"]))
@@ -943,10 +1125,19 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                         return self._err(404, "not_found", "no such terminal")
                     return self._json(200, {"ok": True})
                 if len(parts) == 4 and parts[:2] == ["api", "agents"] and parts[3] in ACTIONS:
+                    self._note = " ".join("%s=%d%s" % (k, len(body[k]), "ch" if k == "text" else "")
+                                          for k in ("text", "paths", "images") if isinstance(body, dict) and isinstance(body.get(k), (str, list)))
                     ACTIONS[parts[3]](unquote(parts[2]), body)
                     hub.kick(unquote(parts[2]))
                     hub.poke()
                     return self._json(200, {"ok": True})
+                if parts == ["api", "screen", "start"]:
+                    kbps, fps = int(body.get("bitrate_kbps", 4000)), int(body.get("fps", 60))
+                    if not (500 <= kbps <= 20000 and 1 <= fps <= 120):
+                        raise ValueError("bitrate_kbps 500-20000, fps 1-120")
+                    return self._json(200, screen("screen.start", {"bitrate_kbps": kbps, "fps": fps}))
+                if parts == ["api", "screen", "stop"]:
+                    return self._json(200, screen("screen.stop"))
                 self._err(404, "not_found", self.path)
             except HerdrError as e:
                 self._err(409, e.code, str(e))
@@ -1017,6 +1208,39 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                 if last:   # the phone left: free the Mac pane now (already gone after DELETE: returns False)
                     close_term(t.id)
 
+        def _helper_stream(self, pane, hid, path):
+            """One helper agent's conversation, read-only: history_full, then history per new entry."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.close_connection = True
+            tail, next_ping = Tail(path, sidechain=True), time.time() + 15
+
+            def full():
+                self._sse("history_full", {"pane_id": pane, "helper_id": hid, "items": tail.items[-500:]})
+
+            try:
+                tail.read()
+                full()
+                while not self._hung_up():
+                    try:
+                        new = tail.read()
+                    except OSError:   # file mid-rename or unreadable: try again next tick
+                        new = []
+                    if new is None:   # file replaced or truncated: send it whole again
+                        tail.read()
+                        full()
+                    for ev in new or []:
+                        self._sse("history", dict(ev, pane_id=pane, helper_id=hid))
+                    if time.time() > next_ping:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        next_ping = time.time() + 15
+                    time.sleep(0.5)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
         def _hung_up(self):
             """True once the other end closed the connection (a GET sends nothing more, so readable = EOF).
             Seen within 0.5 s, instead of waiting for a ping write to fail."""
@@ -1044,6 +1268,7 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
             last, next_ping = None, time.time() + 15
             tail, session = None, False   # False: not looked up yet (None is a real answer: a plain shell)
             status, last_live = None, None
+            last_helpers, next_helpers = [], 0   # [] = what the phone starts with: no event for a chat without helpers
 
             def full():
                 self._sse("history_full", {"pane_id": watch, "items": tail.items[-500:], "title": tail.title})
@@ -1094,6 +1319,15 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                             raise   # the phone went away: stop the stream
                         except OSError:
                             pass    # transcript file mid-rename or unreadable: try again next tick
+                        if time.time() >= next_helpers:   # a listdir + stats, at most every 2 s; sent only when it changed
+                            next_helpers = time.time() + 2
+                            hs = helpers(session) if session else []
+                            # a working helper's last_active moves on every write; the phone shows only
+                            # "working" for it, so that alone is no reason to resend ~10 KB every 2 s
+                            key = [dict(h, last_active=None) if h["working"] else h for h in hs]
+                            if key != last_helpers:
+                                last_helpers = key
+                                self._sse("helpers", {"pane_id": watch, "items": hs})
                         now = agent_of(hub, watch).get("status", "unknown")
                         if v2 and last is not None and (changed or now != status):
                             status = now
