@@ -68,6 +68,8 @@ def call(method, params=None, timeout=5, sock=None):
 
 def screen(method, params=None):
     """Ask the Herdr Screen helper (mac-screen/). Missing helper -> {"status": "not_installed"}."""
+    if sys.platform != "darwin":   # the helper is macOS-only for now (Kuldeepak, 2026-10-17)
+        return {"status": "unsupported", "message": "Remote desktop on Linux is coming soon. Chats work as usual."}
     if not os.path.exists(SCREEN_SOCK):
         return {"status": "not_installed"}
     try:
@@ -123,6 +125,15 @@ CMD_NAME = re.compile(r"<command-name>(.*?)</command-name>")
 CMD_ARGS = re.compile(r"<command-args>(.*?)</command-args>")
 
 
+PASTED = re.compile(r"\s*<pasted_content[^>]*>\n?(.*?)\n?</pasted_content[^>]*>\s*", re.S)
+
+
+def _unpaste(text):
+    """Claude Code saves a long message (a paste, or herdr's prompt) inside <pasted_content> tags: give
+    back the text. Without this it started with "<" like a notification and vanished from the chat."""
+    return PASTED.sub(lambda m: "\n\n" + m.group(1) + "\n\n", text).strip()
+
+
 def _typed(text):
     """A slash command is saved as tags: give it back the way it was typed."""
     m = CMD_NAME.match(text)
@@ -175,9 +186,10 @@ class Tail:
         # A message typed while Claude is busy is only an enqueue. Taken mid-turn (remove,
         # absorbed_mid_turn) it never becomes a user record; taken at turn start (dequeue) it does.
         # Hidden notifications stay in self.queue too, so a dequeue pops the same entry Claude Code did.
-        op, text = d.get("operation"), _typed((d.get("content") or "").strip())
+        raw = (d.get("content") or "").strip()
+        op, text = d.get("operation"), _typed(_unpaste(raw))
         if op == "enqueue" and text:
-            hidden = text.startswith("<")
+            hidden = text.startswith("<") and "<pasted_content" not in raw   # something pasted is never a notification
             out = [] if hidden else [self._add("user", text, d.get("timestamp"), "queued")]
             self.queue.append((text, None if hidden else len(self.items) - 1))
             return out
@@ -220,15 +232,17 @@ class Tail:
         if t == "user":
             if isinstance(content, list):
                 content = "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
-            text = _typed((content or "").strip() if isinstance(content, str) else "")
+            raw = content.strip() if isinstance(content, str) else ""
+            text = _typed(_unpaste(raw))
+            note = text.startswith("<") and "<pasted_content" not in raw   # a notification; something pasted never is
             if text in self.expect:   # the dequeued message written again: it is already in the chat
                 self.expect.remove(text)
                 return []
-            if text and not text.startswith("<"):   # notifications arrive in between; only a real prompt ends the wait
+            if text and not note:   # notifications arrive in between; only a real prompt ends the wait
                 self.expect = []
             if text.startswith("[Request interrupted"):
                 out.append(self._add("note", text, ts))
-            elif text and not text.startswith("<"):
+            elif text and not note:
                 out.append(self._add("user", text, ts))
         else:
             for b in content or []:
@@ -858,9 +872,11 @@ def save_upload(data):
 
 
 def _send(pane, b):
-    """Pictures from the phone are saved as files and their paths typed into the agent with the text,
-    then Enter: Claude Code opens image files from a typed path. Rejected: the Mac clipboard paste
-    (an osascript plus a 0.5 s wait per picture, and it replaced the owner's clipboard)."""
+    """Pictures from the phone are saved as files and their paths sent to the agent with the text, the
+    way /prompt sends text (herdr's prompt for an agent): Claude opens image files from a path. Typed key
+    by key instead, Claude Code dropped the start of a long message and ignored the Enter (2026-10-18).
+    Rejected: the Mac clipboard paste (an osascript plus a 0.5 s wait per picture, and it replaced the
+    owner's clipboard)."""
     images, given = b.get("images") or [], b.get("paths") or []
     if not isinstance(images, list) or not isinstance(given, list) or len(images) + len(given) > 5:
         raise ValueError("images and paths must be lists, at most 5 together")
@@ -884,8 +900,7 @@ def _send(pane, b):
     text = " ".join(paths + given + [str(b.get("text") or "").strip()]).strip()
     if not text:
         raise ValueError("nothing to send")
-    call("pane.send_text", {"pane_id": pane, "text": text})
-    call("pane.send_keys", {"pane_id": pane, "keys": ["enter"]})
+    return _prompt(pane, {"text": text})
 
 
 # pane.* works on every pane; agent.* refuses a plain shell.
@@ -1270,8 +1285,8 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
             status, last_live = None, None
             last_helpers, next_helpers = [], 0   # [] = what the phone starts with: no event for a chat without helpers
 
-            def full():
-                self._sse("history_full", {"pane_id": watch, "items": tail.items[-500:], "title": tail.title})
+            def full():   # the whole transcript: the phone shows the newest part and loads older on request
+                self._sse("history_full", {"pane_id": watch, "items": tail.items, "title": tail.title})
 
             try:
                 self._sse("state", hub.snapshot())
