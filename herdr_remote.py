@@ -16,6 +16,7 @@ import platform
 import pty
 import queue
 import re
+import secrets
 import select
 import shutil
 import signal
@@ -28,6 +29,7 @@ import threading
 import time
 import traceback
 import uuid
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -331,6 +333,37 @@ def prune_tails(keep):
     with _tails_lock:
         for k in [k for k in _tails if k[1] not in keep]:
             del _tails[k]
+
+
+# Parsed Tails of watched chats, kept after a stream stops watching: building one re-reads the whole
+# file (213 ms for an 86 MB transcript) and the phone opens a chat again and again.
+# ponytail: count cap, not memory; items are ~0.2-0.5 MB each. Cap by size if huge chats pile up.
+TAILS, TAILS_LOCK, TAILS_MAX = {}, threading.Lock(), 30
+
+
+def take_tail(sid):
+    """A Tail of this session for one stream alone, read up to now. Popped from the cache, so two
+    streams never share one (a second stream on the same session builds its own)."""
+    with TAILS_LOCK:
+        t = TAILS.pop((CLAUDE_PROJECTS, sid), None)
+    if t is not None and t.path != session_file(sid):   # moved on, or the old session was resumed: start fresh
+        t = None
+    if t is None:
+        t = Tail(session=sid)
+    if t.read() is None:   # the file shrank or was replaced: Tail restarted, read it from the top
+        t.read()
+    t.key = sid   # what it was taken for: after a continued-in move t.session is the new id
+    return t
+
+
+def give_tail(tail):
+    """Back into the cache when a stream stops watching it; the oldest goes past TAILS_MAX."""
+    if tail is None or getattr(tail, "key", None) is None:
+        return
+    with TAILS_LOCK:
+        TAILS[(CLAUDE_PROJECTS, tail.key)] = tail
+        while len(TAILS) > TAILS_MAX:
+            del TAILS[next(iter(TAILS))]
 
 
 def build_state(workspaces, tabs, agents):
@@ -762,6 +795,9 @@ def reap_loop():
             traceback.print_exc()
 
 
+STREAMS = {}   # stream id from hello -> that /api/events stream's queue (under hub.lock)
+
+
 class Hub:
     """Holds the latest state; refreshes it from herdr; fans changes out to SSE clients."""
 
@@ -1054,7 +1090,8 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                 return self._json(200, hub.snapshot())
             if u.path == "/api/events":
                 qs = parse_qs(u.query)
-                return self._events(qs.get("watch", [None])[0], qs.get("v") == ["2"], qs.get("screen") == ["1"])
+                gz = qs.get("gz") == ["1"] and "gzip" in (self.headers.get("Accept-Encoding") or "")
+                return self._events(qs.get("watch", [None])[0], qs.get("v") == ["2"], qs.get("screen") == ["1"], gz)
             parts = u.path.strip("/").split("/")
             if len(parts) == 4 and parts[:2] == ["api", "agents"] and parts[3] == "history":
                 try:
@@ -1095,6 +1132,14 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                         raise ValueError("over 10 MB")
                     return self._json(200, {"path": save_upload(self.rfile.read(n))})
                 body = self._body()
+                if parts == ["api", "watch"]:   # the phone opened another chat: switch its stream, no reconnect
+                    with hub.lock:
+                        q = STREAMS.get(body.get("stream"))
+                    if q is None:
+                        return self._err(404, "no_stream", "no such event stream")
+                    pane = body.get("pane")
+                    q.put(("watch", str(pane) if pane else None))
+                    return self._json(200, {})
                 if parts == ["api", "clipboard"]:
                     clip_set(str(body["text"]))
                     return self._json(200, {"ok": True})
@@ -1163,7 +1208,7 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                 self._err(404, "not_found", self.path)
             except HerdrError as e:
                 self._err(409, e.code, str(e))
-            except (KeyError, ValueError, TypeError, OverflowError) as e:
+            except (KeyError, ValueError, TypeError, OverflowError, AttributeError) as e:
                 self._err(400, "bad_request", repr(e))
             except (OSError, subprocess.SubprocessError) as e:
                 self._err(503, "herdr_offline", str(e))
@@ -1272,21 +1317,34 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
             except OSError:
                 return True
 
-        def _sse(self, event, data):
-            self.wfile.write(("event: %s\ndata: %s\n\n" % (event, json.dumps(data))).encode())
+        def _out(self, data):
+            z = getattr(self, "_gz", None)
+            if z:   # a sync flush per write: the event leaves now instead of waiting for more to compress
+                data = z.compress(data) + z.flush(zlib.Z_SYNC_FLUSH)
+            self.wfile.write(data)
             self.wfile.flush()
 
-        def _events(self, watch, v2=False, want_screen=False):
+        def _sse(self, event, data):
+            self._out(("event: %s\ndata: %s\n\n" % (event, json.dumps(data))).encode())
+
+        def _events(self, watch, v2=False, want_screen=False, gz=False):
             # v2 (web chat, iPhone app from Part 3): history carries the item's index, and `live` replaces
             # the raw screen, which is only sent when asked (screen=1): the spinner redraws it 5 times a
             # second, too much for mobile data. v1 (current iPhone app): history and screen as before.
             # No Content-Length: the body runs until the connection closes, which is valid HTTP/1.1.
+            # gz (app asks with gz=1): one gzip stream for the whole connection, ~1/6 of the bytes.
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
+            if gz:
+                self.send_header("Content-Encoding", "gzip")
             self.end_headers()
             self.close_connection = True
+            self._gz = zlib.compressobj(6, zlib.DEFLATED, 31) if gz else None
             q = hub.subscribe(watch)
+            stream = secrets.token_urlsafe(16)   # POST /api/watch names it to switch this stream's chat
+            with hub.lock:
+                STREAMS[stream] = q
             last, next_ping = None, time.time() + 15
             tail, session = None, False   # False: not looked up yet (None is a real answer: a plain shell)
             status, last_live = None, None
@@ -1296,6 +1354,7 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                 self._sse("history_full", {"pane_id": watch, "items": tail.items, "title": tail.title})
 
             try:
+                self._sse("hello", {"stream": stream})
                 self._sse("state", hub.snapshot())
                 while True:
                     if watch:
@@ -1317,8 +1376,9 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                         try:
                             sid = session_of(hub, watch)
                             if tail is None or sid != session:
-                                session, tail = sid, Tail(session=sid)
-                                tail.read()
+                                give_tail(tail)
+                                tail = None   # if take_tail fails, finally must not give back the old one twice
+                                session, tail = sid, take_tail(sid)
                                 full()
                                 changed = True
                             else:
@@ -1366,17 +1426,35 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                         if kind == "kick":
                             time.sleep(0.03)   # give Claude a moment to draw the key, then re-read at once
                             continue
+                        if kind == "watch":   # start over on the new chat; the next tick sends its screen and history_full
+                            t, tail = tail, None   # cleared first: a failed write below must not give it back twice
+                            give_tail(t)
+                            if last_helpers:   # the phone clears the old chat's helper list
+                                self._sse("helpers", {"pane_id": watch, "items": []})
+                            watch = q.watch = data or None
+                            last, session = None, False
+                            status, last_live = None, None
+                            last_helpers, next_helpers = [], 0
+                            continue
                         self._sse(kind, data)
                     except queue.Empty:
                         pass
                     if time.time() > next_ping:
-                        self.wfile.write(b": ping\n\n")
-                        self.wfile.flush()
+                        self._out(b": ping\n\n")
                         next_ping = time.time() + 15
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
             finally:
+                with hub.lock:
+                    STREAMS.pop(stream, None)
                 hub.unsubscribe(q)
+                give_tail(tail)
+                if self._gz:   # the gzip trailer; the phone has usually gone already
+                    try:
+                        self.wfile.write(self._gz.flush())
+                    except (OSError, ValueError, zlib.error):
+                        pass
+                    self._gz = None
 
     return Handler
 
