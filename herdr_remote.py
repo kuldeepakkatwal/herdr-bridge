@@ -212,6 +212,10 @@ class Tail:
         except ValueError:
             return []
         t = d.get("type")
+        if t != "continued-in" and d.get("timestamp"):
+            # Written after a continued-in: the old session was resumed (claude --resume), so this file is live
+            # again and the pane shows it; following the move would show another conversation (jesse, 2026-10-19).
+            self.moved = None
         if t == "custom-title":   # /rename: the user's name sticks, Claude's later automatic titles don't replace it
             self.custom = d.get("customTitle") or self.custom
             self.title = self.custom or self.title
@@ -229,6 +233,9 @@ class Tail:
         content = (d.get("message") or {}).get("content")
         ts = d.get("timestamp")
         out = []
+        if t == "user" and d.get("isCompactSummary"):
+            # /compact (or auto-compact) saves its summary as a user message: one short line, not a giant bubble.
+            return [self._add("note", "Conversation compacted", ts)]
         if t == "user":
             if isinstance(content, list):
                 content = "\n".join(b.get("text", "") for b in content if b.get("type") == "text")
