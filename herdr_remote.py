@@ -91,6 +91,7 @@ def tilde(path):
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
 CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")   # YYYY/MM/DD/rollout-<time>-<session id>.jsonl
 CODEX_INDEX = os.path.join(HOME, ".codex", "session_index.jsonl")   # {id, thread_name}: Codex's chat titles
+MUSE_SESSIONS = os.path.join(HOME, ".local", "share", "muse", "sessions")   # YYYY/MM/DD/<session id>/session.jsonl
 CODEX_FILE = re.compile(r"^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 _tails = {}   # (projects dir, session id) -> Tail
 _tails_lock = threading.Lock()
@@ -102,6 +103,8 @@ def session_file(session_id):
     hits = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", session_id + ".jsonl"))
     if not hits:   # a Codex tab: herdr reports its thread id, the rollout file ends with it
         hits = glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "rollout-*-%s.jsonl" % glob.escape(session_id)))
+        if not hits:   # a Muse tab: the bridge found its session id itself (muse_panes)
+            hits = glob.glob(os.path.join(MUSE_SESSIONS, "*", "*", "*", glob.escape(session_id), "session.jsonl"))
         return hits[0] if hits else None
     # Claude Code can move a conversation to a new session file (it copies it over) and ends the old
     # file with a continued-in record. herdr keeps reporting the old id, so follow the record.
@@ -171,6 +174,36 @@ def codex_title(session_id):
     return title
 
 
+def _muse_tool(call):
+    """A Muse tool call {name, args (a JSON string)} -> a tool line like Claude's."""
+    raw = call.get("args") or ""
+    try:
+        a = json.loads(raw)
+    except (TypeError, ValueError):
+        a = None
+    if not isinstance(a, dict):
+        return _clip(call.get("name", "tool"), raw)
+    # else the first text argument (read_skill {"name": ...}), else the raw JSON
+    arg = (a.get("command") or a.get("path") or a.get("pattern") or a.get("query")
+           or next((v for v in a.values() if isinstance(v, str) and v), raw))
+    if arg == a.get("path"):
+        arg = os.path.basename(str(arg))
+    return _clip(call.get("name", "tool"), arg)
+
+
+def _muse_ts(us):
+    """Muse's recorded_at (microseconds since 1970) -> the ISO time Claude's entries carry."""
+    try:
+        return datetime.datetime.fromtimestamp(us / 1e6, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _muse_status(tail):
+    """A Muse chat's status in herdr's words, from the turn and approval records it has read."""
+    return "blocked" if tail.waiting else "working" if tail.running else "idle"
+
+
 CMD_NAME = re.compile(r"<command-name>(.*?)</command-name>")
 CMD_ARGS = re.compile(r"<command-args>(.*?)</command-args>")
 
@@ -212,6 +245,7 @@ class Tail:
         self.expect = []   # texts of dequeued messages: Claude Code writes each once more as a user record
         self.queue = []    # Claude Code's queue as (text, item index or None for a hidden notification), oldest first
         self.moved = None  # session id from a continued-in record
+        self.running, self.waiting = False, set()   # Muse: a turn is going on; approvals asked and not yet answered
 
     def _event(self, i):
         return {"item": dict(self.items[i]), "index": i, "replace_last": i == len(self.items) - 1}
@@ -261,6 +295,8 @@ class Tail:
             d = json.loads(line)
         except ValueError:
             return []
+        if "payload_type" in d:
+            return self._muse(d)   # Muse; Claude and Codex records never have payload_type
         t = d.get("type")
         p = d.get("payload")
         if t == "event_msg" and isinstance(p, dict) and p.get("type") == "item_completed":
@@ -322,6 +358,41 @@ class Tail:
             return [self._add("user" if t == "UserMessage" else "assistant", text, ts)] if text else []
         line = _codex_tool(it)
         return [self._add("tool", line, ts)] if line else []
+
+    def _muse(self, d):
+        pt, p = d.get("payload_type"), d.get("payload")
+        if not isinstance(p, dict):
+            return []
+        ts = _muse_ts(d.get("recorded_at"))
+        if pt == "session.name.changed":
+            self.title = p.get("new_name") or self.title
+            return []
+        if pt == "runtime.user_intent.accepted":   # the full text; the run's user_prompt_display shortens pastes
+            text = "\n".join(b.get("text", "") for m in p.get("model_messages") or []
+                             for b in m.get("content") or [] if b.get("kind") == "text").strip()
+            return [self._add("user", text, ts)] if text else []
+        if pt != "runtime.session":
+            return []
+        e = p.get("event") or {}
+        k = e.get("kind")
+        if p.get("kind") == "approval":
+            if k == "requested":
+                self.waiting.add(e.get("pending_action_id"))
+            elif k == "decision_applied":
+                self.waiting.discard(e.get("pending_action_id"))
+            return []
+        if p.get("kind") != "run":
+            return []
+        if k in ("started", "terminal"):
+            self.running = k == "started"
+            if k == "terminal":
+                self.waiting.clear()   # an interrupted turn leaves its question unanswered
+            return []
+        if k == "assistant_message_committed" and (e.get("text") or "").strip():
+            return [self._add("assistant", e["text"].strip(), ts)]
+        if k == "assistant_tool_calls_committed":
+            return [self._add("tool", _muse_tool(c), ts) for c in e.get("tool_calls") or []]
+        return []
 
     def read(self):
         """Events appended since the last read. None: the file shrank or was replaced, start over
@@ -431,8 +502,101 @@ def give_tail(tail):
             del TAILS[next(iter(TAILS))]
 
 
-def build_state(workspaces, tabs, agents):
-    """`agents` is herdr's pane list: every pane, with `agent` None for a plain shell."""
+PANE_ENV = re.compile(r"\sHERDR_PANE_ID=(\S+)")
+MUSE_EVERY = 5   # seconds between looks for Muse processes (a ps and a glob): the refresh runs every second
+_muse = {"at": 0, "panes": {}}   # pane id -> Muse session id, as last found (refresh thread only)
+_muse_pid_of = {}   # Muse session file -> pid from its route_facts record (never changes)
+
+
+def muse_pids(ps_out):
+    """`ps axeww -o pid=,command=` output (command then environment) -> {Muse pid: herdr pane id}.
+    herdr puts HERDR_PANE_ID in the environment of everything started in a pane."""
+    out = {}
+    for line in ps_out.splitlines():
+        parts = line.split(None, 2)
+        m = PANE_ENV.search(line)
+        if len(parts) > 1 and parts[0].isdigit() and os.path.basename(parts[1]).startswith("muse-bin-") and m:
+            out[int(parts[0])] = m.group(1)
+    return out
+
+
+def _muse_file_pid(path):
+    """The Muse pid in a session file's route_facts record (near the top), cached; None if not there (yet)."""
+    if path in _muse_pid_of:
+        return _muse_pid_of[path]
+    pid, lines = None, 0
+    try:
+        with open(path, "rb") as f:
+            for line in f:
+                lines += 1
+                if b'"runtime.session.route_facts"' in line:
+                    try:
+                        pid = ((json.loads(line).get("payload") or {}).get("record") or {}).get("pid")
+                    except (ValueError, AttributeError):
+                        pass
+                    break
+                if lines == 30:
+                    break
+    except OSError:
+        return None
+    if pid is not None or lines == 30:   # a new file may not have it yet: look again next time
+        _muse_pid_of[path] = pid
+    return pid
+
+
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def muse_sessions(pids):
+    """{pid: session file} for these Muse pids: the newest file whose route_facts names the pid
+    (a Muse that starts a new session keeps its pid). Only the top-level files, not helpers' ones."""
+    found = {}
+    files = glob.glob(os.path.join(MUSE_SESSIONS, "*", "*", "*", "*", "session.jsonl"))
+    for path in sorted(files, key=_mtime, reverse=True):
+        if len(found) == len(pids):
+            break
+        pid = _muse_file_pid(path)
+        if pid in pids and pid not in found:
+            found[pid] = path
+    return found
+
+
+def muse_panes(now=None):
+    """{pane id: Muse session id} for panes running Muse, which herdr does not know as an agent.
+    Looked up at most every MUSE_EVERY seconds; the answer in between comes from the last look."""
+    now = time.time() if now is None else now
+    if now - _muse["at"] >= MUSE_EVERY:
+        _muse["at"] = now
+        try:
+            out = subprocess.run(["ps", "axeww", "-o", "pid=,command="], capture_output=True, timeout=3).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = b""
+        pids = muse_pids(out.decode("utf-8", "replace"))
+        files = muse_sessions(set(pids)) if pids else {}
+        _muse["panes"] = {pane: os.path.basename(os.path.dirname(files[pid])) for pid, pane in pids.items() if pid in files}
+    return _muse["panes"]
+
+
+def muse_status(session_id):
+    with _tails_lock:
+        t = _tail(session_id)
+        return _muse_status(t) if t else "unknown"
+
+
+def build_state(workspaces, tabs, agents, muse=None):
+    """`agents` is herdr's pane list: every pane, with `agent` None for a plain shell.
+    `muse`: {pane id: Muse session id} (muse_panes); such a pane is shown as a "muse" agent."""
+    muse = muse or {}
+    # herdr 0.8.2 knows some Muse versions (agent "muse", its own status) but never their session: add it.
+    # A Muse herdr does not know is a plain pane: the status comes from its session file too.
+    agents = [a if a.get("pane_id") not in muse or a.get("agent") not in (None, "muse") or a.get("agent_session")
+              else dict(a, agent="muse", agent_session={"value": muse[a["pane_id"]]},
+                        agent_status=a.get("agent_status") if a.get("agent") else muse_status(muse[a["pane_id"]]))
+              for a in agents]
     tab_label = {t["tab_id"]: t.get("label") for t in tabs}
     out = []
     for w in workspaces:
@@ -447,7 +611,7 @@ def build_state(workspaces, tabs, agents):
                 "tab_id": a.get("tab_id"),
                 "tab_label": tab_label.get(a.get("tab_id")),
                 "title": tab_label.get(a.get("tab_id")) or a.get("terminal_title_stripped") or titles[a["pane_id"]] or a.get("agent") or a["pane_id"],
-                "session_title": titles[a["pane_id"]] if a.get("agent") in ("claude", "codex") else None,   # the agent's conversation title
+                "session_title": titles[a["pane_id"]] if a.get("agent") in ("claude", "codex", "muse") else None,   # the agent's conversation title
                 "agent": a.get("agent"),
                 "status": a.get("agent_status", "unknown"),
                 "session": (a.get("agent_session") or {}).get("value"),   # Claude Code session id: its transcript file
@@ -904,7 +1068,7 @@ class Hub:
 
     def refresh(self):
         try:
-            ws = build_state(call("workspace.list")["workspaces"], call("tab.list")["tabs"], call("pane.list")["panes"])
+            ws = build_state(call("workspace.list")["workspaces"], call("tab.list")["tabs"], call("pane.list")["panes"], muse_panes())
             for w in ws:
                 for a in w["agents"]:
                     if a["status"] == "blocked":
