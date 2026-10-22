@@ -531,13 +531,13 @@ const PILL = { idle: 'idle', working: 'working', blocked: 'needs you', done: 'do
 
 function renderTop() {
   const a = agent();
-  E.title.textContent = a ? a.title : (S.pane ? S.pane : 'Herdr');
+  E.title.textContent = a ? a.title : (S.pane ? S.pane : 'Herdpad');
   E.sub.textContent = a ? a.workspace + (a.agent ? '' : ' · shell') : '';
   const word = a && PILL[a.status];
   E.pill.hidden = !word;
   E.pill.textContent = word || '';
   E.pill.className = 'pill ' + (a ? a.status : '');
-  document.title = a ? (a.status === 'blocked' ? '● ' : '') + a.title + ' · Herdr' : 'Herdr';
+  document.title = a ? (a.status === 'blocked' ? '● ' : '') + a.title + ' · Herdpad' : 'Herdpad';
 }
 
 function setConn(text) {
@@ -609,7 +609,7 @@ function connect() {
   };
   on('state', (d) => {
     S.state = d;
-    setConn(d.herdr === 'offline' ? 'herdr offline' : '');
+    setConn(d.herdr === 'offline' ? 'agent workspace offline' : '');
     renderTop(); renderDrawer(); renderLive(); renderBottom();
   });
   on('history_full', (d) => { if (mine(d)) { S.items = d.items || []; renderAll(); } });

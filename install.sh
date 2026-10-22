@@ -1,5 +1,5 @@
 #!/bin/bash
-# Herdr bridge installer for macOS and Linux.
+# Herdpad bridge installer for macOS and Linux.
 # Run: curl -fsSL https://raw.githubusercontent.com/kuldeepakkatwal/herdr-bridge/main/install.sh | bash
 # Safe to run again: it updates the bridge and restarts it.
 set -euo pipefail
@@ -20,7 +20,7 @@ if [ -z "$TS" ] && [ "$OS" = mac ] && [ -x /Applications/Tailscale.app/Contents/
   TS=/Applications/Tailscale.app/Contents/MacOS/Tailscale
 fi
 [ -n "$TS" ] || fail "Tailscale is not installed. Get it from tailscale.com/download, sign in, then run this again."
-command -v herdr >/dev/null || [ -x "$HOME/.local/bin/herdr" ] || fail "herdr is not installed on this computer. Install herdr first, then run this again."
+command -v herdr >/dev/null || [ -x "$HOME/.local/bin/herdr" ] || fail "The agent workspace (herdr) is not installed on this computer. Install it first, then run this again."
 if [ "$OS" = linux ]; then
   systemctl --user show-environment >/dev/null 2>&1 || fail "systemd user services are not available here (systemctl --user does not work). Log in with a normal desktop or SSH session, then run this again."
 fi
@@ -90,8 +90,8 @@ URL="https://$HOST:$PORT"
 if [ "$OS" = mac ]; then NAME="$(scutil --get ComputerName 2>/dev/null || hostname)"; else NAME="$(hostname)"; fi
 LINK="$("$PY" -c 'import sys,urllib.parse as u;q=lambda s:u.quote(s,safe="");print("herdr://add?url="+q(sys.argv[1])+"&name="+q(sys.argv[2])+"&kind="+q(sys.argv[3]))' "$URL" "$NAME" "$OS")"
 
-say "✓ Herdr bridge is running for $OWNER."
-"$PY" "$DIR/herdr_remote.py" --qr "$LINK" || say "(Could not draw the QR code here. Type the address below in Herdr instead.)"
-say "Scan this with your iPhone (Camera app, or Scan in Herdr), then tap Connect."
-say "Or type this address in Herdr: $URL"
+say "✓ Herdpad bridge is running for $OWNER."
+"$PY" "$DIR/herdr_remote.py" --qr "$LINK" || say "(Could not draw the QR code here. Type the address below in Herdpad instead.)"
+say "Scan this with your iPhone (Camera app, or Scan in Herdpad), then tap Connect."
+say "Or type this address in Herdpad: $URL"
 say "Your iPhone must be signed in to Tailscale as $OWNER."

@@ -1,6 +1,6 @@
 {
-  "name": "Herdr",
-  "short_name": "Herdr",
+  "name": "Herdpad",
+  "short_name": "Herdpad",
   "start_url": "../",
   "scope": "../",
   "display": "standalone",
