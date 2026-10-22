@@ -89,6 +89,9 @@ def tilde(path):
 
 
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
+CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")   # YYYY/MM/DD/rollout-<time>-<session id>.jsonl
+CODEX_INDEX = os.path.join(HOME, ".codex", "session_index.jsonl")   # {id, thread_name}: Codex's chat titles
+CODEX_FILE = re.compile(r"^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
 _tails = {}   # (projects dir, session id) -> Tail
 _tails_lock = threading.Lock()
 
@@ -97,8 +100,9 @@ def session_file(session_id):
     if not session_id or "/" in session_id:
         return None
     hits = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", session_id + ".jsonl"))
-    if not hits:
-        return None
+    if not hits:   # a Codex tab: herdr reports its thread id, the rollout file ends with it
+        hits = glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "rollout-*-%s.jsonl" % glob.escape(session_id)))
+        return hits[0] if hits else None
     # Claude Code can move a conversation to a new session file (it copies it over) and ends the old
     # file with a continued-in record. herdr keeps reporting the old id, so follow the record.
     with open(hits[0], "rb") as f:
@@ -119,8 +123,52 @@ def _tool_line(block):
     arg = i.get("command") or i.get("file_path") or i.get("pattern") or i.get("description") or ""
     if i.get("file_path"):
         arg = os.path.basename(arg)
+    return _clip(block.get("name", "tool"), arg)
+
+
+def _clip(name, arg):
+    """One short tool line: "<name> <arg>", the arg on one line and cut at 80 characters."""
     arg = " ".join(str(arg).split())
-    return "%s %s" % (block.get("name", "tool"), arg[:80] + ("…" if len(arg) > 80 else ""))
+    return "%s %s" % (name, arg[:80] + ("…" if len(arg) > 80 else ""))
+
+
+def _codex_tool(it):
+    """A Codex item_completed tool item -> a tool line like Claude's, or None (reasoning and the rest)."""
+    t = it.get("type")
+    if t == "CommandExecution":
+        c = it.get("command") or []
+        if isinstance(c, str):
+            return _clip("Bash", c)
+        # argv like ["/bin/zsh", "-lc", "<cmd>"]: the shell wrapper is noise, show the command itself
+        return _clip("Bash", c[-1] if len(c) == 3 and c[1] in ("-c", "-lc") else " ".join(map(str, c)))
+    if t == "FileChange":
+        return _clip("Edit", ", ".join(os.path.basename(f) for f in it.get("changes") or {}))
+    if t == "McpToolCall":
+        title = (it.get("arguments") or {}).get("title") if isinstance(it.get("arguments"), dict) else None
+        return _clip("%s.%s" % (it.get("server"), it.get("tool")), title or "")
+    if t == "ImageView":
+        p = it.get("path") or ""
+        return _clip("View", p[len("file://"):] if p.startswith("file://") else p)
+    return None
+
+
+def codex_title(session_id):
+    """Codex's name for the chat from its session index (tiny); the last line for an id wins."""
+    title = None
+    try:
+        with open(CODEX_INDEX, encoding="utf-8") as f:
+            for line in f:
+                if session_id not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("id") == session_id:
+                    title = d.get("thread_name") or title
+    except OSError:
+        pass
+    return title
 
 
 CMD_NAME = re.compile(r"<command-name>(.*?)</command-name>")
@@ -214,6 +262,9 @@ class Tail:
         except ValueError:
             return []
         t = d.get("type")
+        p = d.get("payload")
+        if t == "event_msg" and isinstance(p, dict) and p.get("type") == "item_completed":
+            return self._codex(p.get("item") or {}, d.get("timestamp"))   # Codex; Claude records never look like this
         if t != "continued-in" and d.get("timestamp"):
             # Written after a continued-in: the old session was resumed (claude --resume), so this file is live
             # again and the pane shows it; following the move would show another conversation (jesse, 2026-10-19).
@@ -261,6 +312,17 @@ class Tail:
                     out.append(self._add("tool", _tool_line(b), ts))
         return out
 
+    def _codex(self, it, ts):
+        # Only Codex's item_completed records: its response_item user messages also carry the hidden
+        # <environment_context> and AGENTS.md setup text.
+        t = it.get("type")
+        if t in ("UserMessage", "AgentMessage"):
+            kind = "text" if t == "UserMessage" else "Text"
+            text = "\n".join(b.get("text", "") for b in it.get("content") or [] if b.get("type") == kind).strip()
+            return [self._add("user" if t == "UserMessage" else "assistant", text, ts)] if text else []
+        line = _codex_tool(it)
+        return [self._add("tool", line, ts)] if line else []
+
     def read(self):
         """Events appended since the last read. None: the file shrank or was replaced, start over
         (the caller sends the whole history again)."""
@@ -285,6 +347,9 @@ class Tail:
         out = []
         for raw in lines:
             out.extend(self._record(raw.decode("utf-8", "replace")))
+        m = CODEX_FILE.match(os.path.basename(self.path))
+        if m:   # Codex keeps titles in its index, not the file; re-read on growth so a rename shows up
+            self.title = codex_title(m.group(1)) or self.title
         if self.moved:   # the conversation went on in a new file that repeats it: read that one whole
             self.__init__(session=self.moved)
             self.read()
@@ -382,7 +447,7 @@ def build_state(workspaces, tabs, agents):
                 "tab_id": a.get("tab_id"),
                 "tab_label": tab_label.get(a.get("tab_id")),
                 "title": tab_label.get(a.get("tab_id")) or a.get("terminal_title_stripped") or titles[a["pane_id"]] or a.get("agent") or a["pane_id"],
-                "session_title": titles[a["pane_id"]] if a.get("agent") == "claude" else None,   # Claude's conversation title
+                "session_title": titles[a["pane_id"]] if a.get("agent") in ("claude", "codex") else None,   # the agent's conversation title
                 "agent": a.get("agent"),
                 "status": a.get("agent_status", "unknown"),
                 "session": (a.get("agent_session") or {}).get("value"),   # Claude Code session id: its transcript file
