@@ -27,14 +27,18 @@ fi
 
 say "Downloading the bridge…"
 mkdir -p "$DIR/web"
-for f in herdr_remote.py qrcodegen.py com.herdr-remote.bridge.plist web/index.html web/app.js web/app.css web/marked.min.js web/manifest.webmanifest web/icon.svg web/icon-180.png; do
+FILES="herdr_remote.py qrcodegen.py com.herdr-remote.bridge.plist web/index.html web/app.js web/app.css web/marked.min.js web/manifest.webmanifest web/icon.svg web/icon-180.png"
+[ "$OS" = linux ] && FILES="$FILES herdr_screen.py herdr-screen.service"
+for f in $FILES; do
   curl -fsSL "$BASE/$f" -o "$DIR/$f.new" || fail "Could not download $f. Check the internet connection and run this again."
   mv "$DIR/$f.new" "$DIR/$f"
 done
 
 say "Checking who is signed in to Tailscale…"
 STATUS="$("$TS" status --json 2>/dev/null)" || fail "Tailscale is not running or not signed in. Open Tailscale, sign in, then run this again."
-OWNER="$(printf '%s' "$STATUS" | "$PY" "$DIR/herdr_remote.py" --owner-from-status)" || fail "Could not tell who is signed in to Tailscale. Sign in to Tailscale, then run this again."
+# An update keeps the saved owner: it can be the phone's Tailscale login, which may differ from this computer's.
+OWNER="$("$PY" -c 'import json,sys;print(json.load(open(sys.argv[1])).get("owner") or "")' "$DIR/config.json" 2>/dev/null || true)"
+[ -n "$OWNER" ] || OWNER="$(printf '%s' "$STATUS" | "$PY" "$DIR/herdr_remote.py" --owner-from-status)" || fail "Could not tell who is signed in to Tailscale. Sign in to Tailscale, then run this again."
 HOST="$(printf '%s' "$STATUS" | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
 
 # Run once so the owner and port are saved to ~/.herdr-remote/config.json, then stop it.
@@ -66,6 +70,27 @@ UNIT
   systemctl --user enable --now herdr-remote
   systemctl --user restart herdr-remote   # picks up a newer bridge when it was already running
   loginctl enable-linger "$USER" 2>/dev/null || say "Note: the bridge runs while you are logged in to this computer."
+  # Remote screen helper: X11 desktops only. Runs inside `||` so a failure here never stops the install.
+  is_x11() {
+    local sid
+    sid="$(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$USER" '$3==u && $4=="seat0"{print $1; exit}')"
+    if [ -n "$sid" ]; then [ "$(loginctl show-session "$sid" -p Type --value 2>/dev/null)" = x11 ]; return; fi
+    [ -S /tmp/.X11-unix/X0 ] && [ "${XDG_SESSION_TYPE:-}" != wayland ]
+  }
+  install_screen() {
+    if ! is_x11; then say "Remote screen needs an X11 desktop; skipped (chats still work)."; return 0; fi
+    if ! "$PY" -c 'import gi, Xlib; gi.require_version("Gst", "1.0"); from gi.repository import Gst' 2>/dev/null; then
+      say "Remote screen skipped: some packages are missing. Install them with this line, then run the installer again:"
+      say "sudo apt install python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-vaapi python3-xlib"
+      return 0
+    fi
+    say "Starting the remote screen helper…"
+    sed "s#^ExecStart=/usr/bin/python3 #ExecStart=$PY #" "$DIR/herdr-screen.service" > "$UNITDIR/herdr-screen.service" &&
+      systemctl --user daemon-reload &&
+      systemctl --user enable --now herdr-screen &&
+      systemctl --user restart herdr-screen
+  }
+  install_screen || say "Note: the remote screen helper could not start (chats still work). See: journalctl --user -u herdr-screen"
 fi
 
 # Tailscale's output is shown live: if Serve is off for the account it prints a link and waits until it is approved.

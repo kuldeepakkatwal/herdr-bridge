@@ -69,9 +69,7 @@ def call(method, params=None, timeout=5, sock=None):
 
 
 def screen(method, params=None):
-    """Ask the Herdr Screen helper (mac-screen/). Missing helper -> {"status": "not_installed"}."""
-    if sys.platform != "darwin":   # the helper is macOS-only for now (Kuldeepak, 2026-10-17)
-        return {"status": "unsupported", "message": "Remote desktop on Linux is coming soon. Chats work as usual."}
+    """Ask the Herdr Screen helper (mac-screen/ on a Mac, linux-screen/ on Linux). Missing -> {"status": "not_installed"}."""
     if not os.path.exists(SCREEN_SOCK):
         return {"status": "not_installed"}
     try:

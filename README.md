@@ -29,11 +29,21 @@ On Linux, the installer may ask for your password once. That lets your user publ
 
 Open the bridge address in a browser to get the web chat.
 
+### Remote screen on Linux
+
+On a Linux computer the installer also sets up the remote screen, so you can see and use the desktop from your phone. It only works on an X11 desktop (X11 is the older Linux display system; Linux Mint Cinnamon uses it by default). On Wayland (the newer one, the default on Ubuntu) the installer skips it and chats still work.
+
+If some packages are missing, the installer prints this line instead. Paste it, type your password, then run the install line again:
+
+```
+sudo apt install python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-vaapi python3-xlib
+```
+
 That is it. If something goes wrong, the installer prints one sentence saying what to fix. Fix it and paste the line again.
 
 ## Update
 
-Paste the same install line again. It downloads the newest version and restarts the bridge. Nothing breaks if you run it many times.
+Paste the same install line again. It downloads the newest version and restarts the bridge (and the remote screen helper on Linux). Your saved owner login is kept. Nothing breaks if you run it many times.
 
 ## Uninstall
 
@@ -46,7 +56,7 @@ launchctl bootout gui/$(id -u)/com.herdr-remote.bridge; tailscale serve --https=
 On Linux, paste this instead:
 
 ```
-systemctl --user disable --now herdr-remote; tailscale serve --https=8795 off; rm -rf ~/.herdr-remote ~/.config/systemd/user/herdr-remote.service; systemctl --user daemon-reload
+systemctl --user disable --now herdr-screen 2>/dev/null; systemctl --user disable --now herdr-remote; tailscale serve --https=8795 off; rm -rf ~/.herdr-remote ~/.config/systemd/user/herdr-remote.service ~/.config/systemd/user/herdr-screen.service; systemctl --user daemon-reload
 ```
 
 ## Is it safe?
