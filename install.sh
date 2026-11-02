@@ -70,19 +70,36 @@ UNIT
   systemctl --user enable --now herdr-remote
   systemctl --user restart herdr-remote   # picks up a newer bridge when it was already running
   loginctl enable-linger "$USER" 2>/dev/null || say "Note: the bridge runs while you are logged in to this computer."
-  # Remote screen helper: X11 desktops only. Runs inside `||` so a failure here never stops the install.
-  is_x11() {
+  # Remote screen helper: X11 or Wayland desktops. Runs inside `||` so a failure here never stops the install.
+  # Decide from the seat0 login session's type, never from "an X socket exists": XWayland makes one on Wayland too.
+  session_kind() {
     local sid
-    sid="$(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$USER" '$3==u && $4=="seat0"{print $1; exit}')"
-    if [ -n "$sid" ]; then [ "$(loginctl show-session "$sid" -p Type --value 2>/dev/null)" = x11 ]; return; fi
-    [ -S /tmp/.X11-unix/X0 ] && [ "${XDG_SESSION_TYPE:-}" != wayland ]
+    sid="$(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$USER" '$3==u && $4=="seat0"{print $1; exit}')" || true
+    if [ -n "$sid" ]; then loginctl show-session "$sid" -p Type --value 2>/dev/null || true; return 0; fi
+    if [ -n "${WAYLAND_DISPLAY:-}" ] || [ "${XDG_SESSION_TYPE:-}" = wayland ]; then echo wayland; return 0; fi
+    if [ -S /tmp/.X11-unix/X0 ]; then echo x11; fi
   }
   install_screen() {
-    if ! is_x11; then say "Remote screen needs an X11 desktop; skipped (chats still work)."; return 0; fi
-    if ! "$PY" -c 'import gi, Xlib; gi.require_version("Gst", "1.0"); from gi.repository import Gst' 2>/dev/null; then
+    local kind check pkgs
+    kind="$(session_kind)"
+    case "$kind" in
+      wayland)
+        check='import gi; gi.require_version("Gst", "1.0"); from gi.repository import Gst; Gst.init(None); F = Gst.ElementFactory.find; assert F("pipewiresrc") and F("h264parse") and (F("x264enc") or F("vaapih264enc"))'
+        pkgs="python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly" ;;
+      x11)
+        check='import gi, Xlib; gi.require_version("Gst", "1.0"); from gi.repository import Gst'
+        pkgs="python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-vaapi python3-xlib" ;;
+      *)
+        say "Remote screen needs a desktop you are logged in to (X11 or Wayland); skipped (chats still work)."
+        return 0 ;;
+    esac
+    if ! "$PY" -c "$check" 2>/dev/null; then
       say "Remote screen skipped: some packages are missing. Install them with this line, then run the installer again:"
-      say "sudo apt install python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-vaapi python3-xlib"
+      say "sudo apt install $pkgs"
       return 0
+    fi
+    if [ "$kind" = wayland ]; then
+      say "Wayland desktop: the first time the phone opens the screen, click Share on this computer."
     fi
     say "Starting the remote screen helper…"
     sed "s#^ExecStart=/usr/bin/python3 #ExecStart=$PY #" "$DIR/herdr-screen.service" > "$UNITDIR/herdr-screen.service" &&

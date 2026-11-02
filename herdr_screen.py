@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""herdr_screen.py: shows this Linux (X11) desktop in the Herdr iPhone app and takes its pointer and keys.
+"""herdr_screen.py: shows this Linux desktop (X11 or Wayland) in the Herdr iPhone app and takes its pointer and keys.
 
 Linux twin of mac-screen/ (Swift). Same control socket (~/.herdr-remote/screen.sock, one JSON line in, one out)
 and the same UDP wire format v1 (mac-screen/Core/ScreenWire.swift; golden vectors in test_herdr_screen.py).
 Runs as a systemd user service with DISPLAY=:0. Runtime needs python3-gi + GStreamer (vaapi or x264) and
 python3-xlib; those are imported only by the runtime classes at the bottom, so the pure parts test anywhere.
+On Wayland it uses xdg-desktop-portal (RemoteDesktop + ScreenCast) and PipeWire; the first connect needs a
+Share click on the computer. `--check` prints what this computer offers, for a tester to send back.
 Cursor shapes whose PNG is over 1160 bytes (one datagram) are skipped; the phone keeps its last arrow.
 """
 import base64, hmac, ipaddress, json, os, secrets, socket, struct, subprocess, sys, threading, time, zlib
@@ -212,6 +214,41 @@ def to_unit(mon, rx, ry):
     _, x, y, w, h = mon
     return (rx - x) / max(1, w - 1), (ry - y) / max(1, h - 1), x <= rx < x + w and y <= ry < y + h
 
+def streams_to_monitors(streams):
+    """Portal Start "streams" [(node, {position, size, ...})] -> ([(name, x, y, w, h)] left to right,
+    {name: node}). The portal gives no connector names, so they are "Screen 1", "Screen 2"."""
+    rows = sorted((tuple(p.get("position", (0, 0))), tuple(p.get("size", (0, 0))), node) for node, p in streams)
+    mons, nodes = [], {}
+    for i, ((x, y), (w, h), node) in enumerate(rows):
+        name = f"Screen {i + 1}"
+        mons.append((name, x, y, w, h))
+        nodes[name] = node
+    return mons, nodes
+
+def to_stream(mon, fx, fy):
+    """Phone 0..1 -> the stream's own logical coordinates (what NotifyPointerMotionAbsolute takes)."""
+    _, _, _, w, h = mon
+    fx, fy = min(max(fx, 0.0), 1.0), min(max(fy, 0.0), 1.0)
+    return float(fx * (w - 1)), float(fy * (h - 1))
+
+def load_token(path):
+    try:
+        with open(path) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+def save_token(path, token):
+    """The portal's restore token: lets the next connect skip the Share dialog. Single use, so every Start
+    saves the new one. 0600: it is a standing permission to see and drive this desktop."""
+    if not token:
+        return
+    fd = os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)   # a leftover .new keeps its old mode otherwise
+    with os.fdopen(fd, "w") as f:
+        f.write(token)
+    os.replace(path + ".new", path)
+
 NOTCH = 40.0   # ponytail: phone points per wheel click; tune on the phone if scrolling feels slow or fast
 
 class Scroller:
@@ -395,9 +432,12 @@ class Host:
     MAX_FPS = 30   # ponytail: the Acer is a 4-core laptop already 70% busy; raise for stronger machines
 
     def __init__(self, port, capture, input_, cursor, tailnet_ip, monitors, x11_ok, allow_any_peer=False,
-                 unsupported=None):
+                 unsupported=None, prepare=None, finish=None):
         self.port, self.capture, self.input, self.cursor = port, capture, input_, cursor
         self.unsupported = unsupported   # why capture/input could not load (missing gi, xlib, XTEST)
+        # Wayland: prepare() opens the portal (may wait minutes for a Share click) and returns the monitors;
+        # finish() closes it. One prepare at a time: a phone that reconnects meanwhile waits for the same one.
+        self.prepare, self.finish, self.preparing = prepare, finish, False
         self.query_ip, self.list_monitors, self.x11_ok = tailnet_ip, monitors, x11_ok
         self.allow_any_peer = allow_any_peer   # tests only: 127.0.0.1 is not a tailnet address
         self.lock = threading.RLock()
@@ -441,7 +481,7 @@ class Host:
         self.fps = _clamp(int(params.get("fps", self.MAX_FPS)), 1, self.MAX_FPS)
         if self.unsupported or not x11:
             return {"status": "unsupported", "message": self.unsupported
-                    or "This computer has no X11 desktop on :0. Wayland is not supported yet."}
+                    or "This computer has no desktop session (X11 or Wayland) running right now."}
         if not ip:
             raise ControlError("no_tailnet", "no Tailscale 100.x address on this computer")
         try:
@@ -508,12 +548,39 @@ class Host:
         self.transport.peer = peer
         print(f"phone {peer[0]}:{peer[1]} connected", flush=True)
         self.input.reset()
-        self.monitors = self._query_monitors() or self.monitors   # once per connect; the timer polls unlocked
         self.shown = 0
+        threading.Thread(target=self._lookup_path, args=(peer[0],), daemon=True).start()
+        if self.prepare:   # Wayland: the portal may wait for a Share click; never under the lock
+            self.monitors = []   # no capture (SETTINGS, SHOW) until the portal answers
+            if not self.preparing:
+                self.preparing = True
+                threading.Thread(target=self._prepare_then_capture, daemon=True, name="herdr.portal").start()
+            return
+        self.monitors = self._query_monitors() or self.monitors   # once per connect; the timer polls unlocked
         if self.cursor:
             self.cursor.start(self)
-        threading.Thread(target=self._lookup_path, args=(peer[0],), daemon=True).start()
         self._start_capture()
+
+    def _prepare_then_capture(self):
+        """The portal belongs to the desktop, not to one phone: whichever session is live when it answers
+        uses it (a phone may have reconnected while the dialog was open); none live -> close it."""
+        try:
+            mons, err = self.prepare(), None
+        except Exception as e:
+            mons, err = None, e
+        with self.lock:
+            self.preparing = False
+            if err is not None:
+                print(f"screen sharing not started: {err}", flush=True)
+                if self.live:
+                    self._end()
+                return
+            if not self.live:   # the phone left while the dialog was open
+                if self.finish:
+                    self.finish()
+                return
+            self.monitors = order_monitors(mons)
+            self._restart_capture()
 
     def _start_capture(self):
         if not self.monitors:
@@ -544,6 +611,10 @@ class Host:
         if self.cursor:
             self.cursor.stop()
         self.input.release_all()
+        # After release_all: its key-ups still go through the portal. Not while a prepare is in flight: that
+        # thread holds a portal this call can't see yet, and closes or hands it over itself when it answers.
+        if self.finish and not self.preparing:
+            self.finish()
 
     def _send_status(self):
         w, h = self.capture.size
@@ -654,6 +725,26 @@ def x11_ok():
     except Exception:
         return False
 
+def session_type(run=subprocess.run, env=None, user=None):
+    """"wayland", "x11" or "" for this user's desktop login (the seat0 session). Asked before any X11 check:
+    XWayland gives Wayland desktops an X11 :0 too, and ximagesrc there sees only X11 apps."""
+    env = os.environ if env is None else env
+    try:
+        if user is None:
+            import pwd
+            user = pwd.getpwuid(os.getuid()).pw_name
+        out = run(["loginctl", "list-sessions", "--no-legend"], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            c = line.split()
+            if len(c) >= 4 and c[2] == user and c[3] == "seat0":
+                t = run(["loginctl", "show-session", c[0], "-p", "Type", "--value"],
+                        capture_output=True, text=True, timeout=5).stdout.strip()
+                if t in ("wayland", "x11"):
+                    return t
+    except Exception:
+        pass
+    return "wayland" if env.get("WAYLAND_DISPLAY") else ""
+
 def tailnet_ipv4():
     try:
         out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=5).stdout.split()
@@ -703,12 +794,16 @@ class Capture:
         return (f"video/x-raw,format=I420 ! x264enc tune=zerolatency speed-preset=ultrafast bitrate={kbps} "
                 f"key-int-max=100000 bframes=0 sliced-threads=true ! video/x-h264,profile=main")
 
+    def source(self, mon, fps):
+        _, x, y, w, h = mon
+        return (f"ximagesrc startx={x} starty={y} endx={x + w - 1} endy={y + h - 1} use-damage=false "
+                f"show-pointer=false ! video/x-raw,framerate={fps}/1 ! videoconvert")
+
     def start(self, mon, kbps, fps):
         self.stop()
         _, x, y, w, h = mon
         # appsink drop=false: a dropped encoded frame would break decoding without a frame-id gap to tell the phone.
-        desc = (f"ximagesrc startx={x} starty={y} endx={x + w - 1} endy={y + h - 1} use-damage=false "
-                f"show-pointer=false ! video/x-raw,framerate={fps}/1 ! videoconvert ! {self.encoder(kbps)} "
+        desc = (f"{self.source(mon, fps)} ! {self.encoder(kbps)} "
                 f"! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au "
                 f"! appsink name=sink emit-signals=true sync=false max-buffers=2 drop=false")
         p = self.Gst.parse_launch(desc)
@@ -743,9 +838,12 @@ class Capture:
         """None, or (message, retry). retry: the VAAPI encoder itself failed, so restart now on x264."""
         if not self.p:
             return None
-        m = self.p.get_bus().pop_filtered(self.Gst.MessageType.ERROR)
+        T = self.Gst.MessageType
+        m = self.p.get_bus().pop_filtered(T.ERROR | T.EOS)
         if not m:
             return None
+        if m.type == T.EOS:   # Wayland: the user stopped sharing from GNOME's menu; without this the phone freezes
+            return "the screen stream ended (sharing stopped on the computer?)", False
         err = m.parse_error()[0].message
         if self.running_vaapi and self.vaapi and _from_factory(m.src, "vaapih264enc"):
             self.vaapi = False
@@ -891,6 +989,86 @@ class Input:
         self.scroll = Scroller()
 
 
+class PortalInput:
+    """Phone pointer and keys -> RemoteDesktop portal calls (Wayland). Same message rules as Input: a KEY down
+    is the whole tap, modifiers are pressed around the key or click. Characters go as keysyms; GNOME finds the
+    key and the Shift level itself, and drops keysyms the current layout cannot make."""
+
+    BUTTONS = {0: 0x110, 1: 0x111}                           # BTN_LEFT, BTN_RIGHT (linux/input-event-codes.h)
+    WHEEL = {4: (0, -1), 5: (0, 1), 6: (1, -1), 7: (1, 1)}   # Scroller's X buttons -> (axis 0 vertical, steps)
+
+    def __init__(self, wl):
+        self.wl, self.mon, self.scroll, self.buttons = wl, None, Scroller(), set()
+
+    def _call(self, method, sig, *args):
+        p = self.wl.portal
+        if p is not None:   # None while the Share dialog is still open
+            p.notify(method, sig, args)
+
+    def _key(self, ks, down):
+        self._call("NotifyKeyboardKeysym", "iu", ks, 1 if down else 0)
+
+    def _mods(self, mods, down):
+        for ks in (mod_keysyms(mods) if down else reversed(mod_keysyms(mods))):
+            self._key(ks, down)
+
+    def _tap(self, ks):
+        self._key(ks, True)
+        self._key(ks, False)
+
+    def handle(self, t, f):
+        try:
+            if t == T_MOVE:
+                p = self.wl.portal
+                if self.mon and p is not None:
+                    x, y = to_stream(self.mon, *f)
+                    p.notify("NotifyPointerMotionAbsolute", "udd", (p.nodes[self.mon[0]], x, y))
+            elif t == T_SCROLL:
+                for b in self.scroll.clicks(*f):
+                    axis, steps = self.WHEEL[b]
+                    self._call("NotifyPointerAxisDiscrete", "ui", axis, steps)
+            elif t == T_BUTTON:
+                _, btn, down, _clicks, mods = f
+                b = self.BUTTONS.get(btn)
+                if b is None:
+                    return
+                if down:
+                    self._mods(mods, True)
+                    self._call("NotifyPointerButton", "iu", b, 1)
+                    self.buttons.add(b)
+                else:
+                    self._call("NotifyPointerButton", "iu", b, 0)
+                    self.buttons.discard(b)
+                    self._mods(mods, False)
+            elif t == T_KEY:
+                _, kind, value, down, mods = f
+                ks = NAMED_KEYSYMS.get(value) if kind == 0 else char_keysym(value)
+                if ks is not None and down:
+                    self._mods(mods, True)
+                    self._tap(ks)
+                    self._mods(mods, False)
+            elif t == T_TEXT:
+                for ch in f[1]:
+                    self._tap(char_keysym(ord(ch)))
+        except Exception as e:   # a bad key or a closed portal must not kill the session
+            print(f"input failed: {e!r}", flush=True)
+
+    def release_all(self):
+        """A lost "up" must not leave the desktop dragging or holding a modifier."""
+        try:
+            for b in list(self.buttons):
+                self._call("NotifyPointerButton", "iu", b, 0)
+            self.buttons.clear()
+            for ks in (0xFFE1, 0xFFE3, 0xFFE9):
+                self._key(ks, False)
+        except Exception as e:
+            print(f"release failed: {e!r}", flush=True)
+
+    def reset(self):
+        self.release_all()
+        self.scroll = Scroller()
+
+
 class Cursor:
     """Sends the pointer position (on change, at least every 0.5 s) and its shape (on change, and every 2 s)."""
 
@@ -949,6 +1127,176 @@ class Cursor:
         d.close()
 
 
+# ---- runtime: Wayland (xdg-desktop-portal) ----
+
+class PortalDenied(Exception):
+    pass
+
+class Portal:
+    """One RemoteDesktop + ScreenCast portal session (one live phone). Portal methods answer through a
+    Request object's Response signal; each call waits for it on a private GLib main context, so the helper
+    needs no GLib main loop thread."""
+
+    BUS, PATH = "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop"
+    RD, SC = "org.freedesktop.portal.RemoteDesktop", "org.freedesktop.portal.ScreenCast"
+
+    def __init__(self, token_path):
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib
+        self.Gio, self.GLib, self.token_path = Gio, GLib, token_path
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.sender = self.bus.get_unique_name()[1:].replace(".", "_")
+        self.session, self.nodes, self.mons = None, {}, []
+
+    def prop(self, iface, name):
+        GLib = self.GLib
+        r = self.bus.call_sync(self.BUS, self.PATH, "org.freedesktop.DBus.Properties", "Get",
+                               GLib.Variant("(ss)", (iface, name)), GLib.VariantType("(v)"),
+                               self.Gio.DBusCallFlags.NONE, 5000, None)
+        return r.unpack()[0]
+
+    def _request(self, iface, method, sig, args, options, timeout=10):
+        """Calls a portal method and waits for its Response. Subscribed before the call, on the Request path
+        the portal will use (built from our handle_token), so a fast answer cannot be missed."""
+        GLib, Gio = self.GLib, self.Gio
+        token = "herdr" + secrets.token_hex(4)   # unique per call, also across Portal objects
+        path = f"/org/freedesktop/portal/desktop/request/{self.sender}/{token}"
+        ctx = GLib.MainContext.new()
+        ctx.push_thread_default()   # the Response callback is dispatched on this context, iterated below
+        box = {}
+        sid = None
+        try:
+            # sender None: newer GLib only delivers a well-known sender's signals once it has looked up the
+            # owner, which can lose a fast Response; the path (our random token) already pins the request.
+            sid = self.bus.signal_subscribe(None, "org.freedesktop.portal.Request", "Response", path, None,
+                                            Gio.DBusSignalFlags.NONE, lambda *a: box.update(r=a[5].unpack()))
+            options = dict(options, handle_token=GLib.Variant("s", token))
+            self.bus.call_sync(self.BUS, self.PATH, iface, method, GLib.Variant(f"({sig}a{{sv}})", (*args, options)),
+                               None, Gio.DBusCallFlags.NONE, 5000, None)
+            deadline = time.monotonic() + timeout
+            while "r" not in box and time.monotonic() < deadline:
+                if not ctx.iteration(False):
+                    time.sleep(0.02)
+        finally:
+            if sid is not None:
+                self.bus.signal_unsubscribe(sid)
+            ctx.pop_thread_default()
+        if "r" not in box:
+            raise PortalDenied(f"{method}: no answer in {timeout} s")
+        code, results = box["r"]
+        if code != 0:
+            raise PortalDenied(f"{method}: {'cancelled (Share not clicked)' if code == 1 else 'refused'}")
+        return results
+
+    def open(self):
+        """Creates the session and shows GNOME's Share dialog (skipped when the saved token is accepted).
+        Returns the monitors. Blocks until the user answers (up to 3 minutes)."""
+        V = self.GLib.Variant
+        r = self._request(self.RD, "CreateSession", "", (),
+                          {"session_handle_token": V("s", "herdr" + secrets.token_hex(4))})
+        self.session = r["session_handle"]
+        dev = {"types": V("u", 3), "persist_mode": V("u", 2)}   # keyboard|pointer; keep until revoked
+        tok = load_token(self.token_path)
+        if tok:
+            dev["restore_token"] = V("s", tok)
+        self._request(self.RD, "SelectDevices", "o", (self.session,), dev)
+        cursor = 2 if self.prop(self.SC, "AvailableCursorModes") & 2 else 1   # embedded, else hidden
+        self._request(self.SC, "SelectSources", "o", (self.session,),
+                      {"types": V("u", 1), "multiple": V("b", True), "cursor_mode": V("u", cursor)})
+        r = self._request(self.RD, "Start", "os", (self.session, ""), {}, timeout=180)
+        try:
+            save_token(self.token_path, r.get("restore_token", ""))
+        except OSError as e:   # only costs a Share click next time
+            print(f"restore token not saved: {e!r}", flush=True)
+        if not r.get("devices", 0) & 2:
+            print("portal gave no pointer: the phone can watch but not click", flush=True)
+        self.mons, self.nodes = streams_to_monitors(r.get("streams") or [])
+        if not self.mons:
+            raise PortalDenied("no screen was shared")
+        return self.mons
+
+    def pipewire_fd(self):
+        """A fresh PipeWire connection for one pipeline. The caller closes it after the pipeline stops:
+        pipewiresrc connects on its own dup of it."""
+        GLib = self.GLib
+        r, fds = self.bus.call_with_unix_fd_list_sync(
+            self.BUS, self.PATH, self.SC, "OpenPipeWireRemote", GLib.Variant("(oa{sv})", (self.session, {})),
+            GLib.VariantType("(h)"), self.Gio.DBusCallFlags.NONE, 5000, None, None)
+        return fds.get(r.unpack()[0])   # get() dups; the list closes its own copy when it is freed
+
+    def notify(self, method, sig, args):
+        # No callback = no reply wanted: never blocks the Host lock, and calls stay in order on the connection.
+        # Cost: portal errors on input are not seen.
+        GLib = self.GLib
+        self.bus.call(self.BUS, self.PATH, self.RD, method,
+                      GLib.Variant(f"(oa{{sv}}{sig})", (self.session, {}, *args)), None,
+                      self.Gio.DBusCallFlags.NONE, -1, None, None)
+
+    def close(self):
+        if not self.session:
+            return
+        try:
+            self.bus.call_sync(self.BUS, self.session, "org.freedesktop.portal.Session", "Close", None, None,
+                               self.Gio.DBusCallFlags.NONE, 2000, None)
+        except Exception as e:
+            print(f"portal close failed: {e!r}", flush=True)
+        self.session = None
+
+
+class Wayland:
+    """Holds the portal session of the live phone (None between sessions and while the dialog is open)."""
+
+    def __init__(self, token_path):
+        self.token_path, self.portal, self.mons = token_path, None, []
+
+    def prepare(self):
+        p = Portal(self.token_path)
+        try:
+            mons = p.open()
+        except Exception:
+            p.close()   # also takes a still-open dialog away after a timeout
+            raise
+        self.portal, self.mons = p, mons
+        return mons
+
+    def finish(self):
+        p, self.portal, self.mons = self.portal, None, []
+        if p:
+            p.close()
+
+
+class PortalCapture(Capture):
+    """Capture with the picture from the portal's PipeWire stream instead of ximagesrc. The pointer is drawn
+    into the picture by GNOME (cursor_mode embedded). The stream sends frames only when the screen changes;
+    keepalive-time (when this pipewiresrc has it) resends the last one so a keyframe request is answered on a
+    still screen."""
+
+    def __init__(self, on_frame, wl):
+        super().__init__(on_frame)
+        self.wl, self.fd = wl, None
+        el = self.Gst.ElementFactory.make("pipewiresrc", None)
+        if el is None:
+            raise RuntimeError("GStreamer pipewiresrc is missing (package gstreamer1.0-pipewire)")
+        self.keepalive = hasattr(el.props, "keepalive_time")
+
+    def source(self, mon, fps):
+        p = self.wl.portal
+        ka = " keepalive-time=1000" if self.keepalive else ""
+        self.fd = p.pipewire_fd()
+        return (f"pipewiresrc fd={self.fd} path={p.nodes[mon[0]]} do-timestamp=true{ka} ! videorate "
+                f"! video/x-raw,framerate={fps}/1 ! videoconvert")
+
+    def stop(self):
+        super().stop()   # pipeline at NULL: pipewiresrc has let go of its connection
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+
 # ---- main ----
 
 def main():
@@ -960,14 +1308,19 @@ def main():
             port = int(args.pop(0))
         elif a == "--socket":
             sock = args.pop(0)
+        elif a == "--check":
+            check()
+            return
         else:
             print(f"unknown argument {a}")
             sys.exit(2)
+    if session_type() == "wayland":   # before x11_ok: XWayland opens :0 on Wayland desktops too
+        return main_wayland(port, sock)
     ok = x11_ok()
     print(f"Herdr Screen (Linux): control {sock}, UDP port {port}, X11 {'ok' if ok else 'MISSING'}", flush=True)
-    if not ok:   # answer "unsupported" (Wayland, or no desktop yet); restart with input once X11 is there
+    if not ok:   # answer "unsupported" (no desktop yet); restart once an X11 or Wayland login is there
         def wait_for_x11():
-            while not x11_ok():
+            while not x11_ok() and session_type() != "wayland":
                 time.sleep(5)
             os._exit(1)   # systemd starts us again
         threading.Thread(target=wait_for_x11, daemon=True).start()
@@ -989,6 +1342,63 @@ def main():
     host = Host(port=port, capture=capture, input_=input_, cursor=Cursor(),
                 tailnet_ip=tailnet_ipv4, monitors=x11_monitors_fresh, x11_ok=x11_ok)
     serve_control(sock, host.request)
+
+def main_wayland(port, sock):
+    print(f"Herdr Screen (Linux, Wayland): control {sock}, UDP port {port}", flush=True)
+    token = os.path.expanduser("~/.herdr-remote/screen-portal-token")
+    host = None
+
+    def on_frame(au, us):
+        if host and not host.transport.send_frame(au, us):
+            host.capture.request_keyframe()
+
+    def unsupported(e, retry):
+        print(f"cannot start Wayland capture or input: {e!r}", flush=True)
+        if retry:   # right after login the portal may not be up yet: systemd starts us again in 30 s
+            threading.Thread(target=lambda: (time.sleep(30), os._exit(1)), daemon=True).start()
+        serve_control(sock, Host(port, None, None, None, tailnet_ipv4, lambda: [], lambda: True,
+                                 unsupported=f"Screen sharing could not start on this Wayland desktop: {e}").request)
+
+    try:   # missing gi / pipewiresrc: lasting, so say why instead of crash-looping
+        wl = Wayland(token)
+        capture, input_ = PortalCapture(on_frame, wl), PortalInput(wl)
+    except Exception as e:
+        return unsupported(e, False)
+    try:   # no RemoteDesktop portal: say so now, not per connect
+        version = Portal(token).prop(Portal.RD, "version")
+    except Exception as e:
+        return unsupported(e, True)
+    print(f"RemoteDesktop portal version {version}", flush=True)
+    host = Host(port=port, capture=capture, input_=input_, cursor=None, tailnet_ip=tailnet_ipv4,
+                monitors=lambda: wl.mons, x11_ok=lambda: True, prepare=wl.prepare, finish=wl.finish)
+    serve_control(sock, host.request)
+
+def check():
+    """One report a tester can paste back: what this computer offers for screen sharing."""
+    print("session type:", session_type() or "unknown", "| WAYLAND_DISPLAY:", os.environ.get("WAYLAND_DISPLAY"),
+          "| X11 :0 opens:", x11_ok())
+    tok = os.path.expanduser("~/.herdr-remote/screen-portal-token")
+    try:
+        p = Portal(tok)
+        for iface, names in ((Portal.RD, ("version", "AvailableDeviceTypes")),
+                             (Portal.SC, ("version", "AvailableSourceTypes", "AvailableCursorModes"))):
+            for n in names:
+                try:
+                    print(f"{iface.rsplit('.', 1)[1]}.{n}:", p.prop(iface, n))
+                except Exception as e:
+                    print(f"{iface.rsplit('.', 1)[1]}.{n}: missing ({e})")
+    except Exception as e:
+        print("portal: not reachable:", repr(e))
+    try:
+        import gi
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+        Gst.init(None)
+        for el in ("pipewiresrc", "vaapih264enc", "x264enc", "ximagesrc"):
+            print(f"gstreamer {el}:", "yes" if Gst.ElementFactory.find(el) else "NO")
+    except Exception as e:
+        print("gstreamer: not available:", repr(e))
+    print("restore token saved:", os.path.exists(tok))
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,5 @@
 [Unit]
-Description=Herdr Screen (phone remote desktop, X11)
+Description=Herdr Screen (phone remote desktop, X11 or Wayland)
 After=graphical-session.target
 
 [Service]
