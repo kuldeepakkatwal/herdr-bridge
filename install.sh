@@ -4,7 +4,7 @@
 # Safe to run again: it updates the bridge and restarts it.
 set -euo pipefail
 BASE="${HERDR_BRIDGE_BASE:-https://raw.githubusercontent.com/kuldeepakkatwal/herdr-bridge/main}"
-DIR="$HOME/.herdr-remote"; PORT=8795
+DIR="$HOME/.herdr-remote"; PORT=8795; SCREEN_NOTE=""
 say() { printf '\n%s\n' "$*"; }
 fail() { say "✗ $*"; exit 1; }
 
@@ -93,9 +93,15 @@ UNIT
         say "Remote screen needs a desktop you are logged in to (X11 or Wayland); skipped (chats still work)."
         return 0 ;;
     esac
+    if ! "$PY" -c "$check" 2>/dev/null && command -v apt-get >/dev/null; then
+      # Install them here: a printed "sudo apt install" line scrolled away above the QR code and was missed.
+      say "Installing the video parts the remote screen needs (it may ask for your password once)…"
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs </dev/null || true
+    fi
     if ! "$PY" -c "$check" 2>/dev/null; then
-      say "Remote screen skipped: some packages are missing. Install them with this line, then run the installer again:"
-      say "sudo apt install $pkgs"
+      SCREEN_NOTE="Remote screen is NOT set up: some packages are missing. Install them with this line, then run the installer again:
+sudo apt install $pkgs"
+      say "$SCREEN_NOTE"
       return 0
     fi
     if [ "$kind" = wayland ]; then
@@ -137,3 +143,4 @@ say "✓ Herdpad bridge is running for $OWNER."
 say "Scan this with your iPhone (Camera app, or Scan in Herdpad), then tap Connect."
 say "Or type this address in Herdpad: $URL"
 say "Your iPhone must be signed in to Tailscale as $OWNER."
+[ -z "$SCREEN_NOTE" ] || say "$SCREEN_NOTE"   # again at the end, where it is not scrolled away
