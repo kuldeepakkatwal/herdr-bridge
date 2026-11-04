@@ -1182,7 +1182,12 @@ class Portal:
             if sid is not None:
                 self.bus.signal_unsubscribe(sid)
             ctx.pop_thread_default()
-        if "r" not in box:
+        if "r" not in box:   # cancel it: a dialog left open crashed xdg-desktop-portal-gnome when clicked later
+            try:
+                self.bus.call_sync(self.BUS, path, "org.freedesktop.portal.Request", "Close", None, None,
+                                   Gio.DBusCallFlags.NONE, 2000, None)
+            except Exception:
+                pass
             raise PortalDenied(f"{method}: no answer in {timeout} s")
         code, results = box["r"]
         if code != 0:
@@ -1192,6 +1197,13 @@ class Portal:
     def open(self):
         """Creates the session and shows GNOME's Share dialog (skipped when the saved token is accepted).
         Returns the monitors. Blocks until the user answers (up to 3 minutes)."""
+        try:
+            return self._open()
+        except Exception:
+            self.close()   # no half-open session left behind on GNOME's side
+            raise
+
+    def _open(self):
         V = self.GLib.Variant
         r = self._request(self.RD, "CreateSession", "", (),
                           {"session_handle_token": V("s", "herdr" + secrets.token_hex(4))})
