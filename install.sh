@@ -27,7 +27,7 @@ fi
 
 say "Downloading the bridge…"
 mkdir -p "$DIR/web"
-FILES="herdr_remote.py qrcodegen.py com.herdr-remote.bridge.plist web/index.html web/app.js web/app.css web/marked.min.js web/manifest.webmanifest web/icon.svg web/icon-180.png"
+FILES="hc_bridge.py herdr_remote.py qrcodegen.py com.herdr-remote.bridge.plist web/index.html web/app.js web/app.css web/marked.min.js web/manifest.webmanifest web/icon.svg web/icon-180.png"
 [ "$OS" = linux ] && FILES="$FILES herdr_screen.py herdr-screen.service"
 for f in $FILES; do
   curl -fsSL "$BASE/$f" -o "$DIR/$f.new" || fail "Could not download $f. Check the internet connection and run this again."

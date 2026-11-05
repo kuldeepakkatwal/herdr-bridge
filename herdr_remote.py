@@ -6,6 +6,7 @@ Tailscale-User-Login header this bridge checks.
 """
 import argparse
 import base64
+import contextlib
 import datetime
 import errno
 import fcntl
@@ -32,6 +33,8 @@ import uuid
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
+
+from hc_bridge import DATA, RESIZE, relay, ws_accept   # one copy of the terminal WebSocket code (same folder)
 
 HOME = os.path.expanduser("~")
 SOCK = os.path.join(HOME, ".config/herdr/herdr.sock")
@@ -862,11 +865,11 @@ def read_screen(pane, source="recent_unwrapped", fmt="ansi", lines=400):
     return call("pane.read", params)["read"]["text"]
 
 
-# Terminal mode: herdr's own client (`herdr session attach`) in a pseudo-terminal, streamed to the phone.
+# Terminal view: herdr's own client (`herdr session attach`) in a pseudo-terminal, carried to the phone over
+# /api/term/<pane>/ws (hc_bridge's protocol). The socket's life is the term's life: no idle reaper.
 # launchd's PATH has no ~/.local/bin, so look there ourselves.
 HERDR_BIN = shutil.which("herdr") or os.path.join(HOME, ".local/bin/herdr")
 HERDR_SESSION = "default"
-TERM_IDLE = 10          # seconds without a stream before a term is closed
 TERM_MAX = 3            # terms per bridge; the oldest is closed when exceeded
 TERMS = {}              # term_id -> Term
 TERMS_LOCK = threading.Lock()
@@ -879,7 +882,7 @@ def _winsize(cols, rows):
 
 
 class Term:
-    """One command in a pty. Output chunks land in `q` (None = ended). `streams` counts open SSE readers."""
+    """One command in a pty. Output chunks land in `q` (None = ended)."""
     def __init__(self, pane, cols, rows, argv=None):
         self.id = uuid.uuid4().hex[:12]
         self.pane = pane
@@ -887,8 +890,6 @@ class Term:
         self.alive = True
         self.closed = False
         self.lock = threading.Lock()   # guards fd: the pump closes it, write/resize must never use a stale number
-        self.streams = 0
-        self.last_stream = time.time()
         argv = argv or [HERDR_BIN, "session", "attach", HERDR_SESSION]
         # drop herdr's "you are inside a pane" variables (the bridge may run in one), built before fork
         env = {k: v for k, v in os.environ.items() if not k.startswith("HERDR_")}
@@ -1004,22 +1005,52 @@ def close_all_terms():
         close_term(tid)
 
 
-def reap_terms(now=None):
-    """Close terms nobody has streamed for TERM_IDLE seconds (phone went away without DELETE), and dead ones."""
-    now = now or time.time()
-    with TERMS_LOCK:
-        idle = [t.id for t in TERMS.values() if (t.streams == 0 and now - t.last_stream > TERM_IDLE) or not t.alive]
-    for tid in idle:
-        close_term(tid)
+HERDR_CONFIG = os.path.join(HOME, ".config/herdr/config.toml")
+_phone_cols = [None, 64]   # [config mtime, threshold]
 
 
-def reap_loop():
-    while True:
-        time.sleep(2)
+def herdr_phone_cols():
+    """herdr's mobile_width_threshold (default 64): at this width or less it draws one zoomed pane under a 2-row
+    header, wider it draws its sidebar. The app keeps its terminal under it. Re-read only when the file changes."""
+    try:
+        m = os.stat(HERDR_CONFIG).st_mtime
+    except OSError:
+        return 64
+    if m != _phone_cols[0]:
+        n = 64
         try:
-            reap_terms()
-        except Exception:   # must never die: an unreaped term keeps the Mac pane zoomed and phone-sized
-            traceback.print_exc()
+            with open(HERDR_CONFIG, encoding="utf-8") as f:
+                for line in f:   # ponytail: any line with the key, not only under [ui]; herdr has it nowhere else
+                    k = re.match(r"\s*mobile_width_threshold\s*=\s*(\d+)", line)
+                    if k:
+                        n = int(k.group(1))
+        except OSError:
+            pass
+        _phone_cols[0], _phone_cols[1] = m, n
+    return _phone_cols[1]
+
+
+class PtyStream:
+    """hc_bridge.relay's stream interface over a Term."""
+    ended = b""
+
+    def __init__(self, t):
+        self.t = t
+
+    def next_data(self):
+        d = self.t.q.get()
+        if d is None and self.t.closed:   # closed by us (another phone took the pane, or the cap): not the program
+            raise EOFError                # ending, so relay sends 1011 and the phone offers Retry
+        return d
+
+    def send(self, kind, payload=b""):
+        if kind == DATA:
+            self.t.write(payload)
+        elif kind == RESIZE:
+            self.t.resize(*struct.unpack("<HH", payload))
+
+    def close(self):
+        close_term(self.t.id)   # unzoom + reap; a no-op if a newer term for this pane already replaced it
 
 
 STREAMS = {}   # stream id from hello -> that /api/events stream's queue (under hub.lock)
@@ -1030,7 +1061,7 @@ class Hub:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.state = {"herdr": "offline", "workspaces": []}
+        self.state = {"herdr": "offline", "term": True, "term_cols": herdr_phone_cols(), "workspaces": []}
         self.clients = set()
         self.wake = threading.Event()
 
@@ -1078,9 +1109,9 @@ class Hub:
             with self.lock:
                 watched = {q.watch for q in self.clients if getattr(q, "watch", None)}
             prune_tails({a["session"] for w in ws for a in w["agents"]} | {session_of(self, p) for p in watched})
-            self.publish({"herdr": "online", "workspaces": ws})
+            self.publish({"herdr": "online", "term": True, "term_cols": herdr_phone_cols(), "workspaces": ws})
         except (OSError, HerdrError, ValueError, KeyError):
-            self.publish({"herdr": "offline", "workspaces": self.snapshot()["workspaces"]})
+            self.publish({"herdr": "offline", "term": True, "term_cols": herdr_phone_cols(), "workspaces": self.snapshot()["workspaces"]})
 
     def poke(self):
         """Refresh now (after an action) instead of waiting for the next tick."""
@@ -1127,17 +1158,38 @@ def _prompt(pane, b):
 
 
 IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG")   # JPEG, PNG
-MAX_IMAGE = 10 << 20
+MAX_IMAGE, MAX_VIDEO = 10 << 20, 200 << 20
 
 
-def save_upload(data):
-    """A picture uploaded on attach, so the send itself only carries its path."""
-    if not data.startswith(IMAGE_MAGIC) or len(data) > MAX_IMAGE:
-        raise ValueError("not a JPEG/PNG under 10 MB")
+def save_upload(src, n):
+    """A picture or video uploaded on attach, so the send itself only carries its path. Read from `src` in
+    1 MB pieces straight to the file (a 200 MB video never sits in memory); a wrong type, too big or a short
+    body leaves no file. Videos are MP4/MOV (ISO-BMFF: "ftyp" at bytes 4-8), shrunk on the phone first."""
+    head = src.read(max(0, min(n, 12)))
+    if head.startswith(IMAGE_MAGIC):
+        ext, limit = "png" if head.startswith(b"\x89") else "jpg", MAX_IMAGE
+    elif head[4:8] == b"ftyp":
+        ext, limit = "mov" if head[8:12] == b"qt  " else "mp4", MAX_VIDEO
+    else:
+        raise ValueError("not a JPEG/PNG under 10 MB or an MP4/MOV under 200 MB")
+    if n > limit:
+        raise ValueError("over %d MB" % (limit >> 20))
     os.makedirs(UPLOADS, exist_ok=True)
-    path = os.path.join(UPLOADS, "%d-%s.%s" % (time.time() * 1000, os.urandom(2).hex(), "png" if data.startswith(b"\x89") else "jpg"))
-    with open(path, "wb") as f:
-        f.write(data)
+    path = os.path.join(UPLOADS, "%d-%s.%s" % (time.time() * 1000, os.urandom(2).hex(), ext))
+    try:
+        with open(path, "wb") as f:
+            f.write(head)
+            left = n - len(head)
+            while left > 0:
+                chunk = src.read(min(left, 1 << 20))
+                if not chunk:
+                    raise ValueError("body ended %d bytes short" % left)
+                f.write(chunk)
+                left -= len(chunk)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):   # open() itself may have failed: keep its error
+            os.remove(path)
+        raise
     return path
 
 
@@ -1238,13 +1290,6 @@ def session_of(hub, pane):
     return agent_of(hub, pane).get("session")
 
 
-def _size(body):
-    cols, rows = int(body["cols"]), int(body["rows"])
-    if not (10 <= cols <= 500 and 5 <= rows <= 300):
-        raise ValueError("size out of range")
-    return cols, rows
-
-
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 WEB_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css",
              ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml",
@@ -1337,8 +1382,8 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                 if not path or not os.path.isfile(path):
                     return self._err(404, "not_found", "no such helper")
                 return self._helper_stream(pane, hid, path)
-            if len(parts) == 4 and parts[:2] == ["api", "term"] and parts[3] == "stream":
-                return self._term_stream(parts[2])
+            if len(parts) == 4 and parts[:2] == ["api", "term"] and parts[3] == "ws":
+                return self._term_ws(unquote(parts[2]), parse_qs(u.query))
             if u.path == "/api/clipboard":
                 try:
                     return self._json(200, {"text": clip_get()})
@@ -1351,13 +1396,15 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                 return
             parts = urlparse(self.path).path.strip("/").split("/")
             try:
-                if parts == ["api", "uploads"]:   # raw picture bytes, not JSON
+                if parts == ["api", "uploads"]:   # raw picture or video bytes, not JSON
                     n = int(self.headers.get("Content-Length") or 0)
                     self._note = "bytes=%d" % n
-                    if n > MAX_IMAGE:
-                        self.close_connection = True  # the body was not read
-                        raise ValueError("over 10 MB")
-                    return self._json(200, {"path": save_upload(self.rfile.read(n))})
+                    try:
+                        path = save_upload(self.rfile, n)
+                    except Exception:   # refused, short, or a disk error mid-write
+                        self.close_connection = True   # the body was not (all) read: never parse its rest
+                        raise
+                    return self._json(200, {"path": path})
                 body = self._body()
                 if parts == ["api", "watch"]:   # the phone opened another chat: switch its stream, no reconnect
                     with hub.lock:
@@ -1399,25 +1446,6 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
                     call("%s.rename" % kind, {"%s_id" % kind: unquote(parts[2]), "label": label})
                     hub.poke()
                     return self._json(200, {"ok": True})
-                if len(parts) == 4 and parts[:2] == ["api", "agents"] and parts[3] == "term":
-                    cols, rows = _size(body)
-                    t = open_term(unquote(parts[2]), cols, rows)
-                    return self._json(200, {"term_id": t.id})
-                if len(parts) == 4 and parts[:2] == ["api", "term"] and parts[3] in ("input", "resize"):
-                    with TERMS_LOCK:
-                        t = TERMS.get(parts[2])
-                    if t is None or not t.alive:
-                        return self._err(404, "not_found", "no such terminal")
-                    try:
-                        if parts[3] == "input":
-                            data = base64.b64decode(str(body["data"]))
-                            t.write(data)
-                        else:
-                            size = _size(body)
-                            t.resize(*size)
-                    except OSError:   # the client ended between the lookup and the write
-                        return self._err(404, "not_found", "no such terminal")
-                    return self._json(200, {"ok": True})
                 if len(parts) == 4 and parts[:2] == ["api", "agents"] and parts[3] in ACTIONS:
                     self._note = " ".join("%s=%d%s" % (k, len(body[k]), "ch" if k == "text" else "")
                                           for k in ("text", "paths", "images") if isinstance(body, dict) and isinstance(body.get(k), (str, list)))
@@ -1443,64 +1471,36 @@ def make_handler(hub, owner):   # owner None = --dev: no login check
         def do_DELETE(self):
             if not self._authed():
                 return
-            parts = urlparse(self.path).path.strip("/").split("/")
-            if len(parts) == 3 and parts[:2] == ["api", "term"]:
-                if close_term(parts[2]):
-                    return self._json(200, {"ok": True})
-                return self._err(404, "not_found", "no such terminal")
             self._err(404, "not_found", self.path)
 
-        def _term_stream(self, term_id):
-            with TERMS_LOCK:
-                t = TERMS.get(term_id)
-                ok = t is not None and t.alive
-                if ok:
-                    t.streams += 1
-            if not ok:
-                return self._err(404, "not_found", "no such terminal")
+        def _term_ws(self, pane, qs):
+            """The pane live as a terminal, the same WebSocket protocol as hc_bridge's /api/term/<t>/ws."""
+            self.close_connection = True   # a refused upgrade is never followed by another request
+            key = self.headers.get("Sec-WebSocket-Key")
+            if not key or (self.headers.get("Upgrade") or "").lower() != "websocket":
+                return self._err(400, "bad_request", "websocket only")
+            # Browsers don't apply CORS to WebSockets: any page the owner opens could type into a pane. The app sends no Origin.
+            origin = self.headers.get("Origin")
+            if origin and urlparse(origin).netloc != self.headers.get("Host"):
+                return self._err(403, "forbidden", "cross-site websocket")
+            if not agent_of(hub, pane):   # only panes herdr listed: the id goes into herdr calls
+                return self._err(404, "no_pane", "no such pane")
             try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
+                cols, rows = int(qs.get("cols", ["80"])[0]), int(qs.get("rows", ["24"])[0])
+                t = open_term(pane, max(2, min(cols, 1000)), max(2, min(rows, 1000)))
+            except (HerdrError, OSError, ValueError) as e:
+                return self._err(409, "attach_failed", str(e))
+            try:
+                self.send_response(101)
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.send_header("Sec-WebSocket-Accept", ws_accept(key))
                 self.end_headers()
-                self.close_connection = True
-                next_ping = time.time() + 5   # we talk to the local tailscale serve proxy: a clean close is seen
-                # within 0.5 s (_hung_up); a phone that just vanishes only once tailscaled drops its side
-                while True:
-                    try:
-                        chunk = t.q.get(timeout=0.5)
-                    except queue.Empty:
-                        if self._hung_up():
-                            return
-                        if time.time() > next_ping:
-                            self.wfile.write(b": ping\n\n")
-                            self.wfile.flush()
-                            next_ping = time.time() + 5
-                        continue
-                    if chunk is None:
-                        t.q.put(None)   # leave the end mark for any other reader
-                        self._sse("exit", {})
-                        return
-                    # drain what else is queued so one event carries a whole redraw
-                    while True:
-                        try:
-                            more = t.q.get_nowait()
-                        except queue.Empty:
-                            break
-                        if more is None:
-                            t.q.put(None)
-                            break
-                        chunk += more
-                    self._sse("out", {"data": base64.b64encode(chunk).decode()})
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
-            finally:
-                with TERMS_LOCK:
-                    t.streams -= 1
-                    t.last_stream = time.time()
-                    last = t.streams == 0
-                if last:   # the phone left: free the Mac pane now (already gone after DELETE: returns False)
-                    close_term(t.id)
+                self.wfile.flush()
+            except Exception:
+                close_term(t.id)   # phone gone mid-handshake: never leave the Mac pane zoomed at phone size
+                return
+            relay(self.connection, self.rfile, PtyStream(t))   # closes the term when either side ends
 
         def _helper_stream(self, pane, hid, path):
             """One helper agent's conversation, read-only: history_full, then history per new entry."""
@@ -1765,7 +1765,6 @@ def main():
         print("warning: herdr not reachable yet (%s); will keep retrying" % e, file=sys.stderr)
     hub = Hub()
     threading.Thread(target=hub.run, daemon=True).start()
-    threading.Thread(target=reap_loop, daemon=True).start()
     port = cfg.get("port", 8795)
     owner = None if args.dev else cfg["owner"]
     if args.dev:
